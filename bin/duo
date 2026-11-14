@@ -1,0 +1,33 @@
+#!/usr/bin/env bash
+# duo — запуск duo-пайплайна из ЛЮБОГО проекта (источник истины — репозиторий duo-pipeline).
+# Корень проекта определяет сам оркестратор (--repo > $DUO_REPO > git-корень cwd).
+# Интерпретатор: $DUO_PYTHON > env311 (anaconda/miniconda) > python3.12/3.11/python3 (нужен >= 3.11).
+set -euo pipefail
+
+SELF="$(readlink -f "${BASH_SOURCE[0]}")"
+ROOT="$(cd "$(dirname "$SELF")/.." && pwd)"
+
+pick_python() {
+    if [[ -n "${DUO_PYTHON:-}" ]]; then
+        echo "$DUO_PYTHON"
+        return
+    fi
+    local c
+    for c in "$HOME/anaconda3/envs/env311/bin/python" "$HOME/miniconda3/envs/env311/bin/python"; do
+        if [[ -x "$c" ]]; then
+            echo "$c"
+            return
+        fi
+    done
+    for c in python3.12 python3.11 python3; do
+        if command -v "$c" >/dev/null 2>&1 \
+            && "$c" -c 'import sys; sys.exit(sys.version_info < (3, 11))'; then
+            command -v "$c"
+            return
+        fi
+    done
+    echo "duo: нужен Python >= 3.11 (задай DUO_PYTHON=/путь/к/python)" >&2
+    exit 127
+}
+
+exec "$(pick_python)" "$ROOT/duo_pipeline.py" "$@"

@@ -1,0 +1,12 @@
+[Unit]
+Description=duo-pipeline supervise: надзор за сериями ВСЕХ проектов из реестра (dead/halted -> алерт и авто-возобновление, done/impl_pending -> уведомление)
+
+[Service]
+Type=oneshot
+# КРИТИЧНО: без KillMode=process systemd по завершении oneshot-сервиса убивает ВСЮ cgroup,
+# включая оркестратор, который supervise только что запустил detached.
+KillMode=process
+Environment=DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/%U/bus
+# Проекты берутся из реестра ~/.config/duo-pipeline/projects.json (duo setup / duo projects --add),
+# рабочий каталог не нужен: каждому перезапуску передаётся --repo.
+ExecStart=@ROOT@/bin/duo supervise
