@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# рантайм серий самого инструмента (dogfooding: pipeline/<task>/)
+pipeline/*/.lock
+
+# git-worktree параллельных серий (git.worktrees_dir из config.json)
+/.worktrees/

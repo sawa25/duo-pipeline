@@ -1,0 +1,35 @@
+[project]
+name = "duo-pipeline"
+version = "0.1.0"
+description = "Оркестратор «исполнитель ↔ ревью» (solo / pair / duo) для любых git-проектов"
+requires-python = ">=3.11"
+dependencies = []   # только stdlib: оркестратор — один скрипт
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+extend-exclude = [
+    # серии самого инструмента (dogfooding): артефакты и worktree-копии — не исходный код
+    "pipeline", ".worktrees",
+]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP", "T"]
+# Наследие vca-platform (код переехал оттуда как есть): правила, чистка которых
+# не входит в перенос. Новые правила сюда не добавлять без причины.
+ignore = [
+    "E501", "E402", "E701", "E702",
+    "F401", "F811", "F841",
+    "B007", "B904", "B905", "B023",
+    "UP035", "E741", "E731",
+    "T201",  # print — штатный интерфейс CLI
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["E501", "T201"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+pythonpath = ["."]
+addopts = "--strict-markers --tb=short -q"

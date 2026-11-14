@@ -1,0 +1,84 @@
+{
+  "artifacts_dir": "pipeline",
+  "claude_config_dir": "~/.claude-glm",
+  "council_agents_dir": "~/.claude/agents",
+  "model": "opus",
+  "duo": {
+    "members_plan": [
+      "socrates2",
+      "feynman2"
+    ],
+    "members_impl": [
+      "torvalds2",
+      "meadows2"
+    ],
+    "rounds": 3
+  },
+  "pair": {
+    "reviewer_plan": "feynman2",
+    "reviewer_impl": "torvalds2",
+    "_comment": "режим pair (run --mode pair): исполнитель + ОДИН проверяющий, без дуэта и председателя; ревьюер плана и ревьюер кода — разные персоны (council-<имя>.md в council_agents_dir). feynman2 — исполним ли план буквально, сходятся ли числа; torvalds2 — делает ли код буквально то, что обещали план/эрраты/отчёт. Меняются правкой имён здесь"
+  },
+  "parallel": {
+    "shared_ok": [],
+    "sync_base_at_impl": true,
+    "_comment": "параллельные серии (run --worktree): shared_ok — globs файлов, пересечение по которым НЕ блокирует старт имплементации (напр. doc/99-TODO.md); sync_base_at_impl — перед первой имплементацией подтянуть базу worktree к HEAD основного дерева (только fast-forward и только при чистом worktree)"
+  },
+  "limits": {
+    "max_plan_iterations": 24,
+    "max_impl_iterations": 8,
+    "budget_usd": 220.0,
+    "executor_api_retries": 3,
+    "executor_continue_retries": 2,
+    "reviewer_retries": 2,
+    "budget_grace_usd": 15.0,
+    "_comment": "pipework3 (21.10.2026): лимит итераций и бюджет проверяются на ГРАНИЦЕ итерации — после ревью+синтеза председателя, перед работой исполнителя (уже сделанная версия всегда доходит до вердикта); budget_grace_usd — запас на доведение начатого ревью; повторы: executor_api_retries (транспорт исполнителя), executor_continue_retries (артефакт не записан), reviewer_retries (ревьюеры/председатель). Подъём лимита серии без правки файла: run --continue --add-iterations N / --add-budget USD"
+  },
+  "timeouts": {
+    "executor_sec": 1200,
+    "reviewer_sec": 420,
+    "chairman_sec": 600,
+    "ping_sec": 60,
+    "api_retry_wait_sec": 30,
+    "_comment": "все значения = секунды ТИШИНЫ (нет событий stream-json), НЕ общее время; живой поток событий не прерывается никогда. executor_sec обязан быть > CLAUDE_STREAM_IDLE_TIMEOUT_MS/1000 из claude_env_full (иначе оркестратор убьёт процесс раньше встроенного watchdog claude CLI)"
+  },
+  "claude_env_full": {
+    "CLAUDE_STREAM_IDLE_TIMEOUT_MS": "900000",
+    "CLAUDE_BYTE_STREAM_IDLE_TIMEOUT_MS": "900000",
+    "_comment": "только исполнитель (mode=full); пол встроенного idle-watchdog стрима claude CLI = 300 с → «API Error: The operation timed out.» на длинных генерациях через Z.AI (ingests4b 17.10.2026, дважды: обрыв через 245 и 284 с тишины)"
+  },
+  "git": {
+    "auto_branch": true,
+    "branch_prefix": "duo/",
+    "isolation": "shared",
+    "worktrees_dir": ".worktrees"
+  },
+  "review": {
+    "context": "legacy",
+    "pack_max_chars": 60000,
+    "plan_policy": "triage",
+    "impl_policy": "strict"
+  },
+  "auto_proceed_to_impl": false,
+  "solo": {
+    "model": "sonnet",
+    "max_turns": 24,
+    "_comment": "solo-режим (run --solo): один исполнитель без план-фазы и дуо-ревью; model — алиас claude (sonnet -> glm-5.3-flash); max_turns — предел вызовов-продолжений до маркера SOLO_DONE"
+  },
+  "executor_env_hint": "",
+  "supervisor": {
+    "stale_sec": 300,
+    "dead_max_age_sec": 86400,
+    "auto_resume": true,
+    "auto_resume_kinds": [
+      "transport",
+      "crash"
+    ],
+    "max_resumes": 3,
+    "resume_window_sec": 21600,
+    "_comment": "штатный надзор: `duo_pipeline.py supervise` (systemd-timer, см. systemd/) — dead/halted → алерт; авто-возобновляются ТОЛЬКО transport/crash (потолок max_resumes за окно); limit/budget/errata/artifact_missing — решение человека"
+  },
+  "notify": {
+    "desktop": true
+  }
+}
