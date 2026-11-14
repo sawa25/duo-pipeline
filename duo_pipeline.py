@@ -54,13 +54,12 @@ duo_pipeline.py — оркестратор пайплайна «исполнит
                                               Колонки таблицы — по заголовку (файлы/сообщение), brace-глобы
                                               раскрываются; `--yes` — all-or-nothing: любая аномалия плана →
                                               отказ до первого коммита (`--allow-partial` — только валидные)
-  gates       --task NAME [--ref REF] [--name NAME] [--only ruff,mypy,li,unit,integ]
+  gates       --task NAME [--ref REF] [--name NAME] [--only ШАГ,...]
               [--extra PATH ...] [--dry-run] [--keep]   гейты поставки в ЧИСТОЙ копии
-                                              (git archive REF + заглушки тяжёлых модулей
-                                              gate_stubs/): ruff / mypy / lint-imports /
-                                              pytest tests/unit tests/arch / integration;
-                                              логи и итоговые строки pytest — в
-                                              pipeline/<task>/logs/gates_<UTC>/*/summary.txt,
+                                              (git archive REF): шаги и их argv — из
+                                              gates.steps конфига (плейсхолдеры {py}/{pybin}/{cpus};
+                                              примеры — docs/PROJECT-SETUP.md); логи и итоговые
+                                              строки — в pipeline/<task>/logs/gates_<UTC>/*/summary.txt,
                                               код возврата ≠ 0 при любом красном шаге
   archive     --task NAME [--dry-run] [--yes] [--min-age-days 14] [--archive-root DIR]
               [--force-young] [--print-digest-template] | --list
@@ -73,7 +72,12 @@ duo_pipeline.py — оркестратор пайплайна «исполнит
                                               sha256, сверка со свежим обходом; расхождение = откат
                                               без удаления) → git rm + удаление остатка → дозапись
                                               pipeline/archive/ARCHIVED.txt. НИЧЕГО не коммитит
-                                              (логика: tools/dev/duo_pipeline/archive_cmd.py)
+                                              (логика: archive_cmd.py рядом с оркестратором)
+  projects    [--add PATH] [--remove PATH] [--prune]   реестр проектов для мультипроектного
+                                              надзора (supervise без --repo)
+  setup       [--yes] [--no-register]        подключить проект: git init (по подтверждению),
+                                              каркас .duo/config.json, записи .gitignore,
+                                              регистрация в реестре надзора; повтор — no-op
   selftest                                     проверка транспорта (1 дешёвый вызов)
 
 Артефакты (в <repo>/<artifacts_dir>/<task>/):
@@ -116,10 +120,12 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 DEFAULT_CONFIG = SCRIPT_DIR / "config.json"
 
 DEFAULTS = {
-    "repo": "/home/sawa/GitHub/vca-platform",
+    # R1 (duoportable): ключа repo больше НЕТ — корень проекта разрешается на каждом
+    # запуске: --repo > DUO_REPO > legacy-ключ `repo` слоя --config > автодетект от cwd
+    # (resolve_repo ниже). Проектные переопределения — <repo>/.duo/config.json (R2).
     "artifacts_dir": "pipeline",
-    "claude_config_dir": "/home/sawa/.claude-glm",
-    "council_agents_dir": "/home/sawa/.claude/agents",
+    "claude_config_dir": "~/.claude-glm",           # ~ и $VAR раскрываются в load_config
+    "council_agents_dir": "~/.claude/agents",
     "model": "opus",                    # алиас -> ANTHROPIC_DEFAULT_OPUS_MODEL=glm-5.3
     "duo": {
         # персоны «2» (триаж блокер/эррата для plan; impl-триаж и динамика для impl) — по умолчанию;
@@ -185,10 +191,18 @@ DEFAULTS = {
         # Н5 rev002_impl: каталог worktree-серий; корневой /.worktrees/ в .gitignore
         # захардкожен под ЭТОТ дефолт — при смене обновить паттерн и там
         "worktrees_dir": ".worktrees",
+        # R4 (duoportable): имена тяжёлых untracked-ресурсов, симлинкуемых provisioning'ом
+        # в worktree серии (provision_worktree.py); пусто — симлинков нет
+        "worktree_links": [],
     },
-    # pipegates: набор ядер для pytest-шагов `gates` (taskset -c …); config.json без ключа gates
-    # работает — умолчание живёт здесь (deep_merge не трогает отсутствующие в user-ключи)
-    "gates": {"cpus": "0-11"},
+    # R3 (duoportable): гейты полностью из конфига. steps — список {name, argv, pp, timeout,
+    # summary}; плейсхолдеры argv: {py} (интерпретатор), {pybin} (его каталог), {cpus}.
+    # python: None → sys.executable; stubs: None → <каталог оркестратора>/gate_stubs,
+    # "" → заглушки не подмешиваются. Шагов нет → `gates` отвечает rc=2 с подсказкой.
+    "gates": {"cpus": "0-11", "python": None, "stubs": None, "steps": []},
+    # R5 (duoportable): пути, которые ревьюер НЕ имеет права откатывать (правки хозяина/
+    # оркестратора легитимны): относительно корня repo, fnmatch-глобы допустимы
+    "guard": {"never_revert": []},
     "review": {
         "context": "legacy",             # pipev3 P1 (A3-lite): legacy | hybrid
         "pack_max_chars": 60000,
@@ -201,6 +215,9 @@ DEFAULTS = {
     },
     "auto_proceed_to_impl": False,      # после ACCEPT плана остановиться и ждать `run --continue`
     "executor_env_hint": "",
+    # R7 (duoportable): проектная подсказка в блок изоляции worktree-серий (исполнитель
+    # видит её в каждом промпте); пусто — блок без подсказки
+    "executor_worktree_note": "",
     # правила длинных прогонов на стенде для исполнителя (EXECUTOR_LONG_RUN_RULES):
     # auto — добавлять, если task.md упоминает ssh/стенд/AMD/nohup/setsid; on | off — принудительно
     "executor_long_run_rules": "auto",
@@ -268,11 +285,48 @@ class ErrataError(Exception):
     прошла проверка после записи). НЕ RuntimeError: это не сбой модели, а повод для человека."""
 
 
-def load_config(path: Path | None) -> dict:
+def _read_json_layer(path: Path | None) -> dict | None:
+    """Один конфиг-слой: None — файла нет; пустой dict — пустой JSON-объект.
+    Битый JSON / не-объект / нечитаемый — SystemExit с путём (не трейсбек)."""
+    if path is None or not path.exists():
+        return None
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as e:
+        raise SystemExit(f"конфиг {path}: некорректный JSON — {e}") from None
+    except OSError as e:
+        raise SystemExit(f"конфиг {path}: не читается — {e}") from None
+    if not isinstance(data, dict):
+        raise SystemExit(f"конфиг {path}: ожидался JSON-объект, получено {type(data).__name__}")
+    return data
+
+
+def _expand_cfg_paths(cfg: dict) -> None:
+    """R2: раскрытие ~ и $VAR в путевых ключах конфига (на месте)."""
+    for key in ("claude_config_dir", "council_agents_dir"):
+        val = cfg.get(key)
+        if isinstance(val, str):
+            cfg[key] = os.path.expandvars(os.path.expanduser(val))
+    gates = cfg.get("gates")
+    if isinstance(gates, dict):
+        for key in ("python", "stubs"):
+            val = gates.get(key)
+            if isinstance(val, str):
+                gates[key] = os.path.expandvars(os.path.expanduser(val))
+
+
+def load_config(path: Path | None, repo: Path | str | None = None) -> dict:
+    """Трёхслойная сборка cfg (R2): DEFAULTS ← <инструмент>/config.json ← <repo>/.duo/config.json.
+    Слои deep_merge'ятся (списки замещаются целиком), пути раскрываются (~/$VAR).
+    `_project_config_path` — путь проектного слоя, если файл существует (иначе None)."""
     cfg = json.loads(json.dumps(DEFAULTS))  # deep copy
-    if path and path.exists():
-        user = json.loads(path.read_text(encoding="utf-8"))
-        deep_merge(cfg, user)
+    project_path = Path(repo).resolve() / ".duo" / "config.json" if repo is not None else None
+    for layer in (path, project_path):
+        user = _read_json_layer(Path(layer) if layer is not None else None)
+        if user:
+            deep_merge(cfg, user)
+    cfg["_project_config_path"] = str(project_path) if project_path and project_path.exists() else None
+    _expand_cfg_paths(cfg)
     return cfg
 
 
@@ -282,6 +336,59 @@ def deep_merge(base: dict, extra: dict) -> None:
             deep_merge(base[k], v)
         else:
             base[k] = v
+
+
+def detect_repo_root(cwd: Path | None = None) -> Path | None:
+    """R1: корень git-проекта от каталога. git-common-dir — ОСНОВНОЕ дерево даже из
+    linked worktree (.worktrees/<task>/.git — файл-указатель, а common dir — основной
+    .git). None — не в git / git недоступен."""
+    try:
+        rc, out = sh(["git", "rev-parse", "--path-format=absolute", "--git-common-dir"], cwd=cwd)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if rc != 0:
+        return None
+    p = Path(out.strip())
+    return p.parent.resolve() if p.name == ".git" else None
+
+
+def resolve_repo(*, flag: str | None, legacy: str | None, cmd: str,
+                 cwd: Path | None = None) -> Path | None:
+    """R1: корень проекта. Приоритет: --repo > DUO_REPO > legacy-ключ `repo` слоя --config >
+    автодетект от cwd. supervise БЕЗ явного указания — режим реестра (R8): автодетект не
+    применяется (иначе таймер надзирал бы за репозиторием, в каталоге которого живёт).
+    projects/setup/selftest работают и без корня (None); остальным отсутствие корня —
+    SystemExit с подсказкой (не трейсбек)."""
+    repo_arg = flag or os.environ.get("DUO_REPO") or None
+    if repo_arg:
+        p = Path(repo_arg).expanduser()
+        if not p.is_dir():
+            raise SystemExit(f"--repo/DUO_REPO: каталог не найден: {p}")
+        return p.resolve()
+    if legacy:
+        p = Path(legacy).expanduser()
+        if not p.is_dir():
+            raise SystemExit(f"ключ repo в конфиге указывает на несуществующий каталог: {p}")
+        return p.resolve()
+    if cmd == "supervise":
+        return None
+    root = detect_repo_root(cwd)
+    if root is None and cmd not in ("projects", "setup", "selftest"):
+        where = cwd or Path.cwd()
+        raise SystemExit(
+            f"каталог {where} вне git-репозитория — корень проекта не определён. "
+            "Запусти из каталога проекта, передай --repo PATH (или экспортируй DUO_REPO), "
+            "либо выполни `duo setup` в каталоге проекта")
+    return root
+
+
+def cfg_for_repo(config_path: Path, repo: Path) -> dict:
+    """Полный cfg для конкретного проекта (мультипроектный надзор, R8): слои от --config
+    и <repo>/.duo/config.json + служебные ключи _config_path/repo."""
+    cfg = load_config(config_path, repo=repo)
+    cfg["_config_path"] = str(Path(config_path).resolve())
+    cfg["repo"] = str(Path(repo).resolve())
+    return cfg
 
 
 # ----------------------------------------------------------------------------
@@ -543,8 +650,12 @@ def load_member(cfg: dict, name: str) -> dict:
 # ----------------------------------------------------------------------------
 
 class GitGuard:
-    def __init__(self, repo: Path):
+    def __init__(self, repo: Path, never_revert: tuple[str, ...] | list[str] = ()):
+        # R5 (duoportable): пути, защищённые от отката, приходят из конфига
+        # (guard.never_revert; в vca так был защищён каталог оркестратора в дереве
+        # проекта). Юнит-тесты могут звать без списка — дефолт пуст.
         self.repo = repo
+        self.never_revert = tuple(never_revert)
 
     def status(self) -> str:
         # NUL-separated: надёжный парсинг путей без срезов по индексам
@@ -568,15 +679,14 @@ class GitGuard:
         new = a - b
         if not new:
             return
-        # Зоны, где revert не делается никогда: собственный код пайплайна
-        # (правки хозяина/оркестратора здесь легитимны) и артефакты задач.
-        # pipev5 P-parallel: весь корень артефактов (pipeline/) — не территория
-        # ревьюера: tracked-файлы ЖИВЫХ параллельных серий (state.json,
+        # Зоны, где revert не делается никогда: guard.never_revert конфига (R5) и
+        # артефакты задач. pipev5 P-parallel: весь корень артефактов (pipeline/) —
+        # не территория ревьюера: tracked-файлы ЖИВЫХ параллельных серий (state.json,
         # solo_report) легитимно мутируют во время нашего ревью; откат по
         # снапшоту калечил их (b2bgguf 07.10: три отката state/solo_report).
         # Правку кода ревьюером под pipeline/ фиксируем логом, не revert'ом.
         arts_root_rel = artifacts_rel.rsplit("/", 1)[0]
-        never_revert = ("tools/dev/duo_pipeline/", artifacts_rel, f"{arts_root_rel}/")
+        never_revert = (*self.never_revert, artifacts_rel, f"{arts_root_rel}/")
         # Пути идут в git ДОСЛОВНО из porcelain текущего status() (NUL-разбор):
         # хак _norm прошлых версий («фолбэк для кривых парсингов») удалён —
         # он обрезал первый символ корневых путей (notes.txt→otes.txt,
@@ -2313,13 +2423,16 @@ class Executor:
         return self.state.get("isolation") == "worktree"
 
     def _wt_block(self) -> str:
-        """Изоляция worktree (параллельные серии): пусто в shared — промпты байт-в-байт прежние."""
+        """Изоляция worktree (параллельные серии): пусто в shared — промпты байт-в-байт прежние.
+        R7: проектная подсказка (сервисы, которые нельзя перезапускать) — ключ
+        executor_worktree_note; для vca он воспроизводит прежний хвост дословно."""
         if not self._is_worktree():
             return ""
         branch = f"{(self.cfg.get('git') or {}).get('branch_prefix', 'duo/')}{self.state.get('task', '')}"
+        note = str(self.cfg.get("executor_worktree_note") or "").strip()
         return (f"Изоляция: ты работаешь в отдельном git-worktree `{self.repo}` (ветка `{branch}`); параллельно "
                 "могут идти другие серии в своих worktree. Правь файлы только в этом дереве: основное дерево и "
-                "чужие worktree не трогай, API-сервер :8001 не перезапускай.\n")
+                f"чужие worktree не трогай{', ' + note if note else '.'}\n")
 
     def _long_run_block(self, task_text: str) -> str:
         """Правила длинных прогонов на стенде (EXECUTOR_LONG_RUN_RULES): только если задание о стенде/ssh."""
@@ -2375,7 +2488,7 @@ class Executor:
 Запиши отчёт в `{self.state['artifacts_rel']}/impl_report_v{version}.md` с разделами: что сделано (по пунктам плана); изменённые/созданные файлы; команды тестов и их результат; отклонения от плана.
 В самом КОНЦЕ отчёта — обязательная секция `## commit_plan` — таблица разметки логических коммитов (для человека, подтверждающего коммиты после ACCEPT):
 | группа | файлы (glob) | сообщение коммита (1 строка) | rationale |
-Правила commit_plan: заголовок секции — ровно `## commit_plan` (без номера и дополнений — иначе парсер `commit-by-plan` её не найдёт); заголовок таблицы — СТРОГО эти четыре колонки в этом порядке; группы соответствуют логике плана (пункт задания → коммит); в колонке «файлы» — только пути/globs от корня репо (fnmatch, напр. `tools/dev/duo_pipeline/*.py`, `tests/unit/test_duo_*.py`), каждый в бэктиках, через запятую; пояснения («untracked», «(33)» и т.п.) — в rationale, не в колонку файлов; группы покрывают ВСЕ изменённые/созданные/удалённые файлы задачи; единица группировки — ФАЙЛ: каждый файл входит ровно в ОДНУ группу (несколько пунктов плана в одном файле → одна группа, пункты перечисли в rationale); пересечение групп по файлам запрещено — иначе первый add унесёт общий файл в чужой коммит.
+Правила commit_plan: заголовок секции — ровно `## commit_plan` (без номера и дополнений — иначе парсер `commit-by-plan` её не найдёт); заголовок таблицы — СТРОГО эти четыре колонки в этом порядке; группы соответствуют логике плана (пункт задания → коммит); в колонке «файлы» — только пути/globs от корня репо (fnmatch, напр. `src/*.py`, `tests/unit/test_*.py`), каждый в бэктиках, через запятую; пояснения («untracked», «(33)» и т.п.) — в rationale, не в колонку файлов; группы покрывают ВСЕ изменённые/созданные/удалённые файлы задачи; единица группировки — ФАЙЛ: каждый файл входит ровно в ОДНУ группу (несколько пунктов плана в одном файле → одна группа, пункты перечисли в rationale); пересечение групп по файлам запрещено — иначе первый add унесёт общий файл в чужой коммит.
 Не делай git commit — версионированием управляет оркестратор."""
         reply = self._send(prompt, f"executor_impl_v{version}")
         self._ensure_artifact(f"{self.state['artifacts_rel']}/impl_report_v{version}.md",
@@ -2622,8 +2735,9 @@ def series_changed_paths(cfg: dict, repo: Path, task: str, st: dict) -> list[str
     if not (wt / ".git").exists():
         return []
     arts_rel = st.get("artifacts_rel") or f"{cfg['artifacts_dir']}/{task}"
+    links = worktree_links_of(cfg)
     paths = {p for p in changed_files_all(wt)
-             if not is_provisioned_symlink(wt, p) and not is_artifact_path(p, arts_rel)}
+             if not is_provisioned_symlink(wt, p, links) and not is_artifact_path(p, arts_rel)}
     base = st.get("worktree_base")
     if base:
         rc, out = sh(["git", "diff", "--name-only", base, "HEAD"], cwd=wt)
@@ -2729,8 +2843,10 @@ class Pipeline:
             self.work_path = worktree_path(cfg, self.repo, task).resolve()
         else:
             self.work_path = self.repo
-        self.guard = GitGuard(self.work_path)     # статус/дифф/гварды — по дереву серии
-        self.main_guard = GitGuard(self.repo)     # worktree-администрация — из основного дерева
+        # R5: guard.never_revert — пути, которые ревьюер не откатывает (правки хозяина)
+        never_revert = (cfg.get("guard") or {}).get("never_revert") or []
+        self.guard = GitGuard(self.work_path, never_revert)   # статус/дифф/гварды — по дереву серии
+        self.main_guard = GitGuard(self.repo, never_revert)   # worktree-администрация — из основного дерева
         self._lock_fd = None
 
     def _peek_state(self) -> dict:
@@ -2776,8 +2892,8 @@ class Pipeline:
             return load_json(self.state_file)
         except FileNotFoundError:
             sys.exit(f"state.json не найден для задачи '{self.task}'. "
-                     f"Для новой задачи сначала: python {Path(__file__).name} init --task {self.task} "
-                     f"(или init --task {self.task} --task-file <файл>)")
+                     f"Для новой задачи сначала: duo init --task {self.task} "
+                     f"(или duo init --task {self.task} --task-file <файл>)")
 
     def save_state(self, st: dict) -> None:
         st["state_updated_at"] = time.time()  # pipev4: heartbeat — свежость state для сторожей
@@ -2983,9 +3099,10 @@ class Pipeline:
                 if rc != 0:
                     sys.exit(f"git worktree add не удался: {out.strip()[:300]}")
             log(self.task_dir, f"создан worktree {wt} (ветка {branch}, база {base[:10]})")
-        # provisioning — при каждом запуске (скрипт идемпотентен)
+        # provisioning — при каждом запуске (скрипт идемпотентен); имена ресурсов —
+        # из git.worktree_links конфига (R4)
         rc, out = sh([sys.executable, str(SCRIPT_DIR / "provision_worktree.py"),
-                      str(self.repo), str(wt)], timeout=300)
+                      str(self.repo), str(wt), *worktree_links_of(self.cfg)], timeout=300)
         if rc != 0:
             sys.exit(f"provisioning worktree НЕ удался (fail-closed, серия не стартует): "
                      f"{out.strip()[:300]}")
@@ -3168,7 +3285,8 @@ class Pipeline:
             log(self.task_dir, "БАЗА: не подтягиваю — в ветке серии уже есть коммиты сверх базы")
             return
         dirty = [p for p in changed_files_all(self.work_path)
-                 if not is_provisioned_symlink(self.work_path, p) and not is_artifact_path(p, arts_rel)]
+                 if not is_provisioned_symlink(self.work_path, p, worktree_links_of(self.cfg))
+                 and not is_artifact_path(p, arts_rel)]
         if dirty:
             log(self.task_dir, f"БАЗА: не подтягиваю — в worktree есть изменения: {dirty[:5]}")
             return
@@ -3212,7 +3330,8 @@ class Pipeline:
             return []
         zone = list(claim.get("paths") or [])
         changed = [p for p in changed_files_all(self.work_path)
-                   if not is_provisioned_symlink(self.work_path, p) and not is_artifact_path(p, arts_rel)]
+                   if not is_provisioned_symlink(self.work_path, p, worktree_links_of(self.cfg))
+                   and not is_artifact_path(p, arts_rel)]
         return [p for p in changed if not path_in_zone(p, zone)]
 
     # ---------- основной цикл ----------
@@ -3728,8 +3847,7 @@ class Pipeline:
                     # pipev2: коммит-группы размечены исполнителем, разбор на
                     # коммиты — только через явное подтверждение человеком.
                     log(self.task_dir, f"commit_plan: {arts_rel}/impl_report_v{cur_v}.md — человек подтверждает "
-                                       f"(помощник: python tools/dev/duo_pipeline/duo_pipeline.py "
-                                       f"commit-by-plan --task {self.task})")
+                                       f"(помощник: duo commit-by-plan --task {self.task})")
                     if self.isolation == "worktree":
                         log(self.task_dir, f"после мержа серии: git worktree remove {self.work_path}")
                     return
@@ -3947,7 +4065,7 @@ def parse_commit_plan(report_text: str) -> tuple[list[dict], list[str]]:
 
 def plan_covers_path(groups: list[dict], path: str) -> bool:
     """Покрыт ли путь какой-либо группой: точное совпадение либо fnmatch-глоб
-    от корня репо (напр. `tools/dev/duo_pipeline/*.py`)."""
+    от корня репо (напр. `src/*.py`)."""
     posix_path = path.replace("\\", "/")
     return any(
         path == glob or fnmatch.fnmatch(posix_path, glob)
@@ -3999,16 +4117,17 @@ def changed_status_all(repo: Path) -> list[tuple[str, str]]:
     return result
 
 
-# pipework2 P8: симлинки provisioning worktree (provision_worktree.LINK_TARGETS).
-# Копия константы — duo_pipeline вызывает скрипт subprocess'ом и его не импортирует;
-# синхронность держит юнит-тест (tests/unit/test_duo_pipework2.py).
-PROVISION_LINK_TARGETS = ("data", "models", "node_modules")
+def worktree_links_of(cfg: dict) -> tuple[str, ...]:
+    """R4 (duoportable): имена provisioning-симлинков из git.worktree_links конфига."""
+    return tuple((cfg.get("git") or {}).get("worktree_links") or [])
 
 
-def is_provisioned_symlink(repo: Path, path: str) -> bool:
-    """Корневой симлинк, созданный provisioning'ом worktree: не часть коммита серии
-    (иначе `?? models`/`?? node_modules` попадали в uncovered commit-by-plan)."""
-    return path in PROVISION_LINK_TARGETS and (Path(repo) / path).is_symlink()
+def is_provisioned_symlink(repo: Path, path: str,
+                           links: tuple[str, ...] | list[str] = ()) -> bool:
+    """Корневой симлинк, созданный provisioning'ом worktree (имена — git.worktree_links,
+    R4): не часть коммита серии (иначе `?? models`/`?? node_modules` попадали в
+    uncovered commit-by-plan). links=() — прямой юнит-вызов без конфига."""
+    return path in links and (Path(repo) / path).is_symlink()
 
 
 def changed_files_all(repo: Path) -> list[str]:
@@ -4016,14 +4135,16 @@ def changed_files_all(repo: Path) -> list[str]:
     return [p for _, p in changed_status_all(repo)]
 
 
-def collect_commit_groups(repo: Path, task_dir: Path, version: int, artifacts_rel: str) -> dict:
+def collect_commit_groups(repo: Path, task_dir: Path, version: int, artifacts_rel: str,
+                          worktree_links: tuple[str, ...] | list[str] = ()) -> dict:
     """Снимок для commit-by-plan (чистая функция для юнитов).
 
     Читает impl_report_v{version}.md, парсит commit_plan, сверяет с
     changed_files_all(). Пути артефактов самой задачи ({artifacts_rel}/)
     исключаются из coverage (коммитятся человеком отдельно по прецеденту
     «chore(pipeline): артефакты …»), но возвращаются списком artifacts.
-    Отсутствующий файл отчёта -> предупреждение, без исключения.
+    worktree_links — provisioning-симлинки (R4), вне coverage. Отсутствующий
+    файл отчёта -> предупреждение, без исключения.
     """
     report = task_dir / f"impl_report_v{version}.md"
     if not report.exists():
@@ -4032,7 +4153,7 @@ def collect_commit_groups(repo: Path, task_dir: Path, version: int, artifacts_re
             "uncovered": [], "overlaps": [], "artifacts": [], "changed": [],
         }
     groups, warnings = parse_commit_plan(report.read_text(encoding="utf-8"))
-    changed = [p for p in changed_files_all(repo) if not is_provisioned_symlink(repo, p)]
+    changed = [p for p in changed_files_all(repo) if not is_provisioned_symlink(repo, p, worktree_links)]
     # pipev3 P1b: единая граница фильтра is_artifact_path — раньше bare
     # startswith(prefix) пропускал запись «?? pipeline/<task>» (сам каталог
     # артефактов/симлинк worktree попадал в coverage), а untracked_list
@@ -4243,7 +4364,7 @@ def cmd_rework(cfg: dict, args) -> None:
     if args.run:
         run_detached(cfg, args.task, argv=["--config", str(args.config), "run", "--task", args.task])
     else:
-        print(f"запусти: python {Path(__file__).name} run --task {args.task}")
+        print(f"запусти: duo run --task {args.task}")
 
 
 def cmd_hold(cfg: dict, args, hold: bool) -> None:
@@ -4287,7 +4408,8 @@ def cmd_commit_by_plan(cfg: dict, args) -> None:
     arts_rel = f"{cfg['artifacts_dir']}/{args.task}"
     yes_all = bool(getattr(args, "yes", False))  # pipev4: --yes = подтверждение всех групп без интерактива
     # pipev3 P2: снимок и коммиты — по дереву серии (worktree), а не p.repo
-    snap = collect_commit_groups(p.work_path, p.task_dir, version, arts_rel)
+    snap = collect_commit_groups(p.work_path, p.task_dir, version, arts_rel,
+                                 worktree_links_of(cfg))
     groups, warnings = snap["groups"], snap["warnings"]
     print(f"commit_plan: {arts_rel}/impl_report_v{version}.md, групп: {len(groups)}")
     for w in warnings:
@@ -4421,6 +4543,15 @@ def cmd_commit_by_plan(cfg: dict, args) -> None:
 # CLI
 # ----------------------------------------------------------------------------
 
+def _detached_argv(cfg: dict, argv: list[str] | None = None) -> list[str]:
+    """R1 (duoportable): argv ребёнка с ЯВНЫМ --repo (глобальный флаг — ДО подкоманды):
+    detached-процесс не зависит от cwd родителя и DUO_REPO в его окружении."""
+    base = list(sys.argv[1:] if argv is None else argv)
+    if any(a == "--repo" for a in base):
+        return base
+    return ["--repo", str(Path(cfg["repo"]).resolve()), *base]
+
+
 def run_detached(cfg: dict, task: str, argv: list[str] | None = None) -> None:
     """pipev1 П1 (Д-11): ре-экзек себя в новой сессии — оркестратор больше
     не живёт в foreground-группе терминала (abort терминала его не убивает).
@@ -4438,7 +4569,7 @@ def run_detached(cfg: dict, task: str, argv: list[str] | None = None) -> None:
     bg_log = task_dir / "orchestrator_bg.log"
     # argv=None — ре-экзек текущей командной строки `run ...`; rework --run передаёт свой
     # (в sys.argv тогда лежит `rework ...`, а не `run`)
-    cmd = [sys.executable, str(Path(__file__).resolve()), *(argv if argv is not None else sys.argv[1:]), "--fg"]
+    cmd = [sys.executable, str(Path(__file__).resolve()), *_detached_argv(cfg, argv), "--fg"]
     with open(bg_log, "ab") as lf:
         proc = subprocess.Popen(cmd, stdout=lf, stderr=lf, stdin=subprocess.DEVNULL,
                                 start_new_session=True)
@@ -4489,7 +4620,7 @@ def cmd_init(cfg: dict, args) -> None:
         save_json(stf, new_state)
     elif pins:
         print(f"state.json уже есть — флаги режима/изоляции не применены: передай их в `run --task {args.task}`")
-    print(f"OK: {task_dir}\nОтредактируй task.md, затем: python {Path(__file__).name} run --task {args.task}")
+    print(f"OK: {task_dir}\nОтредактируй task.md, затем: duo run --task {args.task}")
 
 
 def resolve_mode_flags(args) -> dict:
@@ -4736,6 +4867,10 @@ def supervise_tick(cfg: dict, *, auto_resume: bool | None = None, now: float | N
     дедупликации алертов и счётчики авто-возобновлений — вне репозитория (XDG_STATE_HOME),
     в репо ничего не пишется (GitGuard вычищал бы лишнее под pipeline/).
 
+    R8 (duoportable): записи состояния и уведомления — на КЛЮЧЕ <абс-корень>::<task>
+    (одноимённые серии разных проектов не глушат алерты друг друга), заголовок
+    уведомления — `duo <проект>/<task>`; spawn ребёнка идёт с явным --repo.
+
     dead / halted с разрешённым kind → алерт (один раз на событие) и, при auto_resume,
     `run --task T --resume` detached; потолок max_resumes за resume_window_sec на задачу.
     Остановки limit/budget/artifact_missing/errata — только алерт: решение за человеком."""
@@ -4744,7 +4879,9 @@ def supervise_tick(cfg: dict, *, auto_resume: bool | None = None, now: float | N
     auto = sup["auto_resume"] if auto_resume is None else auto_resume
     spath = state_path or _supervisor_state_path()
     sstate = _supervisor_load(spath)
-    arts_root = Path(cfg["repo"]).resolve() / cfg["artifacts_dir"]
+    repo = Path(cfg["repo"]).resolve()
+    arts_root = repo / cfg["artifacts_dir"]
+    project = repo.name
     spawn = spawn or (lambda task: run_detached(cfg, task, argv=["--config", str(cfg.get("_config_path", DEFAULT_CONFIG)),
                                                                 "run", "--task", task, "--resume"]))
     notify = notify or (lambda title, body: subprocess.run(
@@ -4755,7 +4892,8 @@ def supervise_tick(cfg: dict, *, auto_resume: bool | None = None, now: float | N
         info = classify_task(st_file.parent, now=now, stale_sec=sup["stale_sec"],
                              dead_max_age_sec=sup["dead_max_age_sec"])
         task = info["task"]
-        rec = sstate.setdefault(task, {})
+        skey = f"{repo}::{task}"
+        rec = sstate.setdefault(skey, {})
         if info["kind"] == "done" or (info["kind"] == "idle" and info["phase"] == "impl_pending"):
             # событие «серия завершена / план принят»: один раз, только свежее (≤ 1 ч)
             ev = f"{info['phase']}:{int(info.get('updated_at', 0))}"
@@ -4764,24 +4902,27 @@ def supervise_tick(cfg: dict, *, auto_resume: bool | None = None, now: float | N
                 if not baseline and info.get("age_sec", 1e9) <= 3600:
                     label = ("ГОТОВО (impl принят)" if info["phase"] == "done"
                              else "план принят — ждёт запуска имплементации")
-                    act = {"task": task, "kind": info["phase"], "action": "notice", "reason": label}
+                    act = {"task": task, "project": project, "kind": info["phase"], "action": "notice",
+                           "reason": label}
                     if (cfg.get("notify") or {}).get("desktop") and not dry_run:
                         with contextlib.suppress(Exception):
-                            notify(f"duo {task}: {label}", f"потрачено ${info.get('spent_usd', 0):.2f}")
+                            notify(f"duo {project}/{task}: {label}", f"потрачено ${info.get('spent_usd', 0):.2f}")
                     actions.append(act)
             continue
         if info["kind"] not in ("dead", "halted"):
             rec.pop("alerted", None)
             continue
         event_key = f"{info['kind']}:{(info.get('halt') or {}).get('at', '')}:{info['phase']}:{int(info.get('spent_usd', 0) * 100)}"
-        act = {"task": task, "kind": info["kind"], "action": "none", "reason": info.get("stop_reason", "")}
+        act = {"task": task, "project": project, "kind": info["kind"], "action": "none",
+               "reason": info.get("stop_reason", "")}
         if rec.get("alerted") != event_key:
             rec["alerted"] = event_key
             act["action"] = "alert"
             if ((cfg.get("notify") or {}).get("desktop") and not dry_run
                     and not (info.get("halt") or {}).get("notified")):      # оркестратор уже уведомил сам
                 with contextlib.suppress(Exception):
-                    notify(f"duo {task}: {info['kind']}", (info.get("stop_reason") or "оркестратор умер без halt")[:200])
+                    notify(f"duo {project}/{task}: {info['kind']}",
+                           (info.get("stop_reason") or "оркестратор умер без halt")[:200])
         resumable = (info["kind"] == "dead" or
                      ((info.get("halt") or {}).get("resumable") and (info["halt"].get("kind") in sup["auto_resume_kinds"])))
         if auto and resumable:
@@ -4806,17 +4947,119 @@ def supervise_tick(cfg: dict, *, auto_resume: bool | None = None, now: float | N
     return actions
 
 
-def cmd_supervise(cfg: dict, args) -> None:
-    """Один тик надзора (systemd-timer) либо `--loop --interval N` (без systemd: nohup/tmux)."""
+def cmd_supervise(cfg: dict, args, *, single: bool) -> None:
+    """Один тик надзора (systemd-timer) либо `--loop --interval N` (без systemd: nohup/tmux).
+    R8 (duoportable): single=True — ровно один проект (явный --repo/DUO_REPO либо legacy-ключ
+    repo конфига); иначе — все проекты реестра (projects.json). Пустой реестр — понятное
+    сообщение и rc=0 (таймер не должен падать)."""
+    if single:
+        targets = [(Path(cfg["repo"]).resolve().name, cfg)]
+    else:
+        projects = load_projects()
+        if not projects:
+            print(f"SUPERVISE: реестр проектов пуст ({_projects_registry_path()}) — нечего надзирать. "
+                  "Подключение: `duo setup` в каталоге проекта либо `duo projects --add PATH`")
+            return
+        targets = [(p.name, cfg_for_repo(Path(args.config), p)) for p in projects]
     while True:
-        acts = supervise_tick(cfg, auto_resume=True if args.resume else None, dry_run=args.dry_run)
+        acts: list[dict] = []
+        for project, cfg_i in targets:
+            acts.extend(supervise_tick(cfg_i, auto_resume=True if args.resume else None,
+                                       dry_run=args.dry_run))
         for a in acts:
-            print(f"SUPERVISE: {a['task']} {a['kind']} → {a['action']} :: {str(a['reason'])[:200]}", flush=True)
+            print(f"SUPERVISE: [{a.get('project', '?')}] {a['task']} {a['kind']} → {a['action']} :: "
+                  f"{str(a['reason'])[:200]}", flush=True)
         if not acts and not args.loop:
             print("SUPERVISE: все серии в порядке (нет dead/halted)")
         if not args.loop:
             return
         time.sleep(args.interval)
+
+
+# ----------------------------------------------------------------------------
+# R8 (duoportable): реестр проектов для мультипроектного надзора
+# ----------------------------------------------------------------------------
+
+def _projects_registry_path() -> Path:
+    base = os.environ.get("XDG_CONFIG_HOME") or str(Path.home() / ".config")
+    return Path(base) / "duo-pipeline" / "projects.json"
+
+
+def load_projects() -> list[Path]:
+    """Проекты реестра (по одному на строку, абсолютные пути). Нет файла/пусто — [];
+    битый JSON — предупреждение в stderr и [] (мультипроектный надзор деградирует до
+    «пусто», а не валится и не затирает файл)."""
+    path = _projects_registry_path()
+    try:
+        data = load_json(path)
+    except FileNotFoundError:
+        return []
+    except (OSError, json.JSONDecodeError) as e:
+        print(f"SUPERVISE: реестр проектов {path} не читается ({e}) — работаю с пустым", file=sys.stderr)
+        return []
+    if not isinstance(data, dict):
+        print(f"SUPERVISE: реестр проектов {path}: ожидался JSON-объект — работаю с пустым", file=sys.stderr)
+        return []
+    out: list[Path] = []
+    for p in data.get("projects") or []:
+        try:
+            rp = Path(str(p)).expanduser().resolve()
+        except (TypeError, ValueError):
+            continue
+        if rp not in out:
+            out.append(rp)
+    return out
+
+
+def save_projects(projects: list[Path]) -> None:
+    path = _projects_registry_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    save_json(path, {"projects": [str(p) for p in projects]})
+
+
+def cmd_projects(cfg: dict, args) -> None:
+    """R8: реестр проектов. Без флагов — таблица (проект / каталог на месте / .duo /
+    активных серий); --add/--remove/--prune меняют реестр (идемпотентны)."""
+    reg = _projects_registry_path()
+    projects = load_projects()
+    if args.prune:
+        kept = [p for p in projects if p.is_dir()]
+        gone = [p for p in projects if not p.is_dir()]
+        if gone:
+            save_projects(kept)
+            for p in gone:
+                print(f"убран (каталога нет): {p}")
+        else:
+            print("нечего убирать: все каталоги на месте")
+        projects = kept
+    if args.add:
+        p = Path(args.add).expanduser().resolve()
+        if not p.is_dir():
+            sys.exit(f"--add: каталог не найден: {p}")
+        if p in projects:
+            print(f"уже в реестре: {p}")
+        else:
+            projects.append(p)
+            save_projects(projects)
+            print(f"добавлен: {p}")
+    if args.remove:
+        p = Path(args.remove).expanduser().resolve()
+        if p in projects:
+            projects.remove(p)
+            save_projects(projects)
+            print(f"удалён: {p}")
+        else:
+            print(f"не найден в реестре: {p}")
+    print(f"реестр: {reg}")
+    if not projects:
+        print("пусто; подключение: `duo setup` в каталоге проекта либо `duo projects --add PATH`")
+        return
+    print(f"{'проект':<44} {'каталог':>7} {'.duo':>5} {'серий':>6}")
+    for p in projects:
+        arts = p / cfg.get("artifacts_dir", "pipeline")
+        n_series = len(list(arts.glob("*/state.json"))) if p.is_dir() else 0
+        print(f"{str(p):<44} {'есть' if p.is_dir() else 'НЕТ':>7} "
+              f"{'да' if (p / '.duo' / 'config.json').exists() else '—':>5} {n_series:>6}")
 
 
 def cmd_errata(cfg: dict, args) -> None:
@@ -4888,7 +5131,8 @@ def _merge_locked(cfg: dict, args, p: Pipeline) -> int:
         return 1
     if (wt / ".git").exists():
         dirty = [x for x in changed_files_all(wt)
-                 if not is_provisioned_symlink(wt, x) and not is_artifact_path(x, arts_rel)]
+                 if not is_provisioned_symlink(wt, x, worktree_links_of(cfg))
+                 and not is_artifact_path(x, arts_rel)]
         if dirty:
             print(f"ОТКАЗ: в worktree {wt} есть незакоммиченные изменения ({len(dirty)}): {dirty[:8]}")
             print(f"Закоммить их (`commit-by-plan --task {task}`), затем повтори merge")
@@ -4972,7 +5216,7 @@ def _finish_merge(cfg: dict, p: Pipeline, st: dict, target: str, merged: bool, k
     if keep or not (wt / ".git").exists():
         return
     # симлинки, созданные provisioning'ом/артефактами, снимаем сами: worktree тогда «чист» для git
-    for link in [wt / cfg["artifacts_dir"] / p.task, *(wt / n for n in PROVISION_LINK_TARGETS)]:
+    for link in [wt / cfg["artifacts_dir"] / p.task, *(wt / n for n in worktree_links_of(cfg))]:
         if link.is_symlink():
             link.unlink()
     # грабля 1: подтяжка базы могла принести в ветку серии артефакты (симлинк скрывал их
@@ -5039,35 +5283,43 @@ def cmd_claims(cfg: dict, args) -> None:
 
 # ----------------------------------------------------------------------------
 # pipegates: гейты поставки в ЧИСТОЙ копии (CLAUDE.md п.6 «гейты поставки = гейты
-# CI»): git archive REF + заглушки тяжёлых модулей (gate_stubs/ рядом со скриптом,
-# падают при импорте — как CI-раннер без torch/onnx/…), все шаги — в копии, в
-# рабочее дерево проекта команда не пишет, state.json только читает, .lock не берёт.
+# CI»): git archive REF + опциональные заглушки тяжёлых модулей (gate_stubs/ рядом
+# со скриптом, падают при импорте — как CI-раннер без torch/onnx/…), все шаги — в
+# копии, в рабочее дерево проекта команда не пишет, state.json только читает,
+# .lock не берёт. R3 (duoportable): НАБОР ШАГОВ И ИХ АРГУМЕНТЫ — из конфига
+# (gates.steps; плейсхолдеры {py}/{pybin}/{cpus}); примеры — docs/PROJECT-SETUP.md.
 # ----------------------------------------------------------------------------
 
-GATES_STEPS = ("ruff", "mypy", "li", "unit", "integ")   # имена шагов = имена лог-файлов
+
+def _gates_resolve(cfg: dict) -> dict:
+    """Параметры гейтов из конфига (R3): шаги с раскрытыми плейсхолдерами, интерпретатор,
+    каталог заглушек. gates.python: None/отсутствует → sys.executable; gates.stubs:
+    None → <каталог оркестратора>/gate_stubs, "" → заглушки выключены, путь → путь."""
+    gates = cfg.get("gates") or {}
+    py = Path(str(gates.get("python") or sys.executable)).resolve()
+    pybin = py.parent
+    cpus = str(gates.get("cpus", "0-11"))
+    stubs = gates.get("stubs")
+    if stubs is None:
+        stubs_dir: Path | None = SCRIPT_DIR / "gate_stubs"
+    elif str(stubs) == "":
+        stubs_dir = None
+    else:
+        stubs_dir = Path(str(stubs))
+    steps = []
+    for raw in gates.get("steps") or []:
+        argv = [str(a).replace("{py}", str(py)).replace("{pybin}", str(pybin))
+                .replace("{cpus}", cpus) for a in (raw.get("argv") or [])]
+        steps.append({"name": str(raw.get("name", "")), "argv": argv,
+                      "pp": bool(raw.get("pp", False)),
+                      "timeout": int(raw.get("timeout", 900)),
+                      "summary": str(raw.get("summary") or "last_line")})
+    return {"py": py, "pybin": pybin, "cpus": cpus, "stubs_dir": stubs_dir, "steps": steps}
 
 
-def gates_steps(copy_dir: Path, stubs_dir: Path, pybin: Path, cpus: str) -> list[dict]:
-    """План шагов гейтов: команды — как в ручном gate-прогоне эксперта, один в один:
-    ruff check . / mypy / lint-imports; pytest — под env -u DATA_DIR -u LOG_DIR +
-    taskset -c <cpus> nice -n 10, БЕЗ доп. -q (addopts в pyproject уже есть).
-    pp=True → шагу нужен PYTHONPATH=<stubs>:<copy> (заглушки тяжёлых модулей;
-    как у эксперта — только pytest-шагам, линтеры идут без PYTHONPATH)."""
-    py = str(pybin / "python")
-    return [
-        {"name": "ruff", "pp": False, "timeout": 900,
-         "argv": [str(pybin / "ruff"), "check", "."]},
-        {"name": "mypy", "pp": False, "timeout": 900,
-         "argv": [str(pybin / "mypy")]},
-        {"name": "li", "pp": False, "timeout": 900,
-         "argv": [str(pybin / "lint-imports")]},
-        {"name": "unit", "pp": True, "timeout": 7200,
-         "argv": ["env", "-u", "DATA_DIR", "-u", "LOG_DIR", "taskset", "-c", cpus,
-                  "nice", "-n", "10", py, "-m", "pytest", "tests/unit", "tests/arch"]},
-        {"name": "integ", "pp": True, "timeout": 7200,
-         "argv": ["env", "-u", "DATA_DIR", "-u", "LOG_DIR", "taskset", "-c", cpus,
-                  "nice", "-n", "10", py, "-m", "pytest", "-m", "integration and not gpu"]},
-    ]
+def gates_steps(cfg: dict) -> list[dict]:
+    """Разрешённые шаги гейтов (R3) — чистая функция для юнитов/регрессий."""
+    return _gates_resolve(cfg)["steps"]
 
 
 def _gates_default_runner(argv: list[str], *, cwd: Path, env: dict, timeout: float | None) -> tuple[int, str]:
@@ -5082,12 +5334,12 @@ def _gates_default_runner(argv: list[str], *, cwd: Path, env: dict, timeout: flo
         return 127, f"BIN MISSING: {argv[0]}"
 
 
-def _gates_summary_extract(name: str, out: str) -> str:
-    """Хвост для строки summary: у pytest-шагов — последняя строка вывода ДОСЛОВНО
-    (итог «N passed»); у lint-imports — строки контрактов, как в ручном прогоне.
-    Пустой вывод → «(no output)» (эррата Е1)."""
+def _gates_summary_extract(mode: str, out: str) -> str:
+    """Хвост для строки summary (R3): last_line — последняя строка вывода ДОСЛОВНО
+    (итог pytest «N passed»); contracts — строки контрактов lint-imports, как в
+    ручном прогоне. Пустой вывод → «(no output)» (эррата Е1)."""
     lines = out.strip().splitlines() or ["(no output)"]
-    if name == "li":
+    if mode == "contracts":
         kept = [ln for ln in lines if re.search(r"Contracts:|broken|kept", ln)]
         return " ".join(kept[-2:]) if kept else lines[-1]
     return lines[-1]
@@ -5096,18 +5348,21 @@ def _gates_summary_extract(name: str, out: str) -> str:
 def cmd_gates(cfg: dict, args, runner: Callable | None = None) -> int:
     """Гейты поставки в чистой копии (git archive REF). Безопасность: не пишет в
     рабочее дерево проекта (только pipeline/<task>/logs/gates_*), state.json только
-    читает, .lock НЕ берётся (сосуществует с живым оркестратором), ничего не
-    запускает из data/ и models/, GPU/:8001 не касается; временную копию удаляет
-    (кроме --keep). Код возврата: 0 — все шаги зелёные; 1 — есть красный."""
+    читает, .lock НЕ берётся (сосуществует с живым оркестратором); временную копию
+    удаляет (кроме --keep). Шаги — gates.steps конфига (R3); пустой набор — rc=2
+    с подсказкой. Код возврата: 0 — все шаги зелёные; 1 — есть красный; 2 — шаги
+    не заданы."""
     repo = Path(cfg["repo"]).resolve()
     task_dir = repo / cfg["artifacts_dir"] / args.task
     if not task_dir.exists():
         sys.exit(f"Задача не найдена: {task_dir}. Сначала `init --task {args.task}`.")
-    stubs_dir = SCRIPT_DIR / "gate_stubs"
-    if not stubs_dir.is_dir():
-        sys.exit(f"нет каталога заглушек {stubs_dir} (ожидаются 5 пакетов — поставь из репозитория)")
-    pybin = Path(sys.executable).resolve().parent
-    cpus = (cfg.get("gates") or {}).get("cpus", "0-11")
+    g = _gates_resolve(cfg)
+    steps, stubs_dir = g["steps"], g["stubs_dir"]
+    if not steps:
+        print("gates.steps не заданы в .duo/config.json (пример — docs/PROJECT-SETUP.md)")
+        return 2
+    if stubs_dir is not None and not stubs_dir.is_dir():
+        sys.exit(f"нет каталога заглушек {stubs_dir} (gates.stubs в конфиге)")
     branch = f"{cfg['git']['branch_prefix']}{args.task}"
     try:
         st = load_json(task_dir / "state.json")
@@ -5118,11 +5373,12 @@ def cmd_gates(cfg: dict, args, runner: Callable | None = None) -> int:
     if rc != 0:
         sys.exit(f"REF {ref!r} не найден в {repo}" + (" (серия ещё не коммитила — попробуй `--ref HEAD`)"
                  if ref == branch else ""))
+    names = [s["name"] for s in steps]
     if args.only:
-        unknown = [s for s in args.only.split(",") if s not in GATES_STEPS]
+        unknown = [s for s in args.only.split(",") if s not in names]
         if unknown:
-            sys.exit(f"неизвестные шаги --only: {unknown}; допустимы {list(GATES_STEPS)}")
-    only = [s for s in GATES_STEPS if not args.only or s in args.only.split(",")]
+            sys.exit(f"неизвестные шаги --only: {unknown}; допустимы {names}")
+    only = [s for s in names if not args.only or s in args.only.split(",")]
     if args.name and not re.fullmatch(r"[A-Za-z0-9._-]+", args.name):
         sys.exit(f"--name {args.name!r}: допустимы буквы/цифры/._-")
     extras = []
@@ -5141,16 +5397,17 @@ def cmd_gates(cfg: dict, args, runner: Callable | None = None) -> int:
         log_dir = task_dir / "logs" / f"{base}_{n}"
         n += 1
     copy_dir = Path(tempfile.mkdtemp(prefix=f"duo_gates_{args.task}_"))
-    print(f"gates: task={args.task} ref={ref} copy={copy_dir} stubs={stubs_dir} pybin={pybin} "
-          f"cpus={cpus} logs={log_dir}")
+    stubs_txt = str(stubs_dir) if stubs_dir is not None else "(off)"
+    print(f"gates: task={args.task} ref={ref} copy={copy_dir} stubs={stubs_txt} py={g['py']} "
+          f"cpus={g['cpus']} logs={log_dir}")
     try:
         if args.dry_run:
-            steps = gates_steps(copy_dir, stubs_dir, pybin, cpus)
-            total = len(GATES_STEPS)
+            total = len(steps)
             for i, step in enumerate(steps, 1):
                 print(f"[{i}/{total}] {step['name']} → {log_dir / (step['name'] + '.txt')}")
                 if step["pp"]:
-                    print(f"  env: PYTHONPATH={stubs_dir}:{copy_dir}")
+                    pp_val = f"{stubs_dir}:{copy_dir}" if stubs_dir is not None else str(copy_dir)
+                    print(f"  env: PYTHONPATH={pp_val}")
                 print(f"  $ {shlex.join(step['argv'])}")
             print("dry-run: шаги не запускались, копия не строилась")
             return 0
@@ -5176,16 +5433,16 @@ def cmd_gates(cfg: dict, args, runner: Callable | None = None) -> int:
         note(f"gate {args.name or args.task} ref={ref} files={' '.join(extras)}")
         run = runner or _gates_default_runner
         red = False
-        for step in gates_steps(copy_dir, stubs_dir, pybin, cpus):
+        for step in steps:
             if step["name"] not in only:
                 continue
             env = os.environ.copy()
             if step["pp"]:
-                env["PYTHONPATH"] = f"{stubs_dir}:{copy_dir}"
+                env["PYTHONPATH"] = (f"{stubs_dir}:{copy_dir}" if stubs_dir is not None else str(copy_dir))
             print(f"[{step['name']}] {shlex.join(step['argv'])[:120]} …")
             rc, out = run(step["argv"], cwd=copy_dir, env=env, timeout=step["timeout"])
             (log_dir / f"{step['name']}.txt").write_text(out, encoding="utf-8")
-            note(f"{step['name']} rc={rc} : {_gates_summary_extract(step['name'], out)}")
+            note(f"{step['name']} rc={rc} : {_gates_summary_extract(step['summary'], out)}")
             print(f"    rc={rc}")
             red = red or rc != 0
         note("GATE_DONE")
@@ -5218,9 +5475,109 @@ def cmd_selftest(cfg: dict, args) -> None:
     print("SELFTEST OK")
 
 
+GITIGNORE_MARKER = "# duo-pipeline: рантайм серий (duo setup)"
+
+
+def cmd_setup(cfg: dict, args, repo: Path | None) -> None:
+    """R9 (duoportable): подключить проект. repo=None — cwd вне git: `git init` по
+    подтверждению (--yes — неинтерактивно; без tty и без --yes — отказ с подсказкой);
+    после init при отсутствии коммитов — предупреждение (worktree-сериям нужен коммит).
+    Шаги идемпотентны: .duo/config.json не перезаписывается (только каркас при
+    отсутствии), .gitignore не дублируется (маркер-комментарий), повторная регистрация
+    в реестре — no-op. Повторный `duo setup` печатает «УЖЕ» и выходит rc=0."""
+    root = repo
+    target: Path | None = None
+    if root is not None and detect_repo_root(root) is None:
+        # явный --repo на каталог вне git: как `cd <каталог> && duo setup` (git init по подтверждению)
+        target, root = root, None
+    if root is None:
+        cwd = target or Path.cwd()
+        if not args.yes:
+            if not sys.stdin.isatty():
+                sys.exit(f"{cwd} вне git-репозитория и нет tty для подтверждения: выполни `git init` "
+                         f"сам либо запусти `duo setup --yes`")
+            try:
+                ans = input(f"{cwd} не в git: выполнить `git init`? [y/N] ")
+            except (EOFError, OSError):
+                ans = ""
+            if ans.strip().lower() not in ("y", "yes", "д", "да"):
+                sys.exit("без git-репозитория setup не выполняется (запусти из каталога проекта "
+                         "или `duo setup --yes`)")
+        rc, out = sh(["git", "init"], cwd=cwd)
+        if rc != 0:
+            sys.exit(f"git init не удался: {out.strip()[:300]}")
+        root = cwd.resolve()
+        print(f"git init: {root}")
+        rc, _ = sh(["git", "rev-parse", "--verify", "-q", "HEAD"], cwd=root)
+        if rc != 0:
+            print("ВНИМАНИЕ: в репозитории нет ни одного коммита — worktree-серии (`duo run --worktree`) "
+                  "заработают после первого коммита; setup его не делает")
+    done: list[str] = []
+    had: list[str] = []
+    # каркас .duo/config.json (существующий не трогаем — это конфиг проекта)
+    proj_cfg = root / ".duo" / "config.json"
+    if proj_cfg.exists():
+        had.append(f".duo/config.json уже есть: {proj_cfg}")
+    else:
+        proj_cfg.parent.mkdir(parents=True, exist_ok=True)
+        proj_cfg.write_text(json.dumps({
+            "_comment": "переопределения duo-пайплайна для проекта (слои: DEFAULTS < config.json "
+                        "инструмента < этот файл); справочник ключей — docs/PROJECT-SETUP.md "
+                        "в репозитории duo-pipeline",
+            "executor_env_hint": "",
+            "executor_worktree_note": "",
+            "gates": {"steps": []},
+            "git": {"worktree_links": []},
+        }, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        done.append(f"создан каркас {proj_cfg} (заполни gates.steps и пр. по мере надобности)")
+    # .gitignore: рантайм серий под маркером, без дублей
+    arts = str(cfg.get("artifacts_dir", "pipeline"))
+    wtd = str((cfg.get("git") or {}).get("worktrees_dir", ".worktrees"))
+    entries = [f"{arts}/*/.lock", f"/{wtd}/"]
+    gi = root / ".gitignore"
+    lines = gi.read_text(encoding="utf-8").splitlines() if gi.exists() else []
+    missing = [e for e in entries if e not in lines]
+    if not missing:
+        had.append(f".gitignore уже содержит записи duo ({', '.join(entries)})")
+    else:
+        out_lines = list(lines)
+        if GITIGNORE_MARKER in out_lines:
+            i = out_lines.index(GITIGNORE_MARKER)
+            out_lines[i + 1:i + 1] = missing
+        else:
+            if out_lines and out_lines[-1].strip():
+                out_lines.append("")
+            out_lines += [GITIGNORE_MARKER, *missing]
+        gi.write_text("\n".join(out_lines) + "\n", encoding="utf-8")
+        done.append(f".gitignore: добавлены {missing} (маркер «{GITIGNORE_MARKER}»)")
+    # реестр надзора
+    if not args.no_register:
+        projects = load_projects()
+        if root in projects:
+            had.append(f"проект уже в реестре ({_projects_registry_path()})")
+        else:
+            projects.append(root)
+            save_projects(projects)
+            done.append(f"проект зарегистрирован для надзора (supervise без --repo): {root}")
+    else:
+        had.append("регистрация в реестре пропущена (--no-register)")
+    for m in had:
+        print(f"УЖЕ: {m}")
+    for m in done:
+        print(f"СДЕЛАНО: {m}")
+    print(f"корень проекта: {root}")
+    if done:
+        print("ВАЖНО: закоммить `.duo/` и `.gitignore` ДО первой серии — иначе `commit-by-plan --yes` "
+              "увидит их как «не покрытые» и откажет (all-or-nothing)")
+    print("дальше: отредактируй .duo/config.json (гейты и пр.), затем `duo init --task <имя>` "
+          "и `duo run --task <имя>`")
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description="дуо-пайплайн исполнитель↔надсмотрщик на GLM 5.3 (Z.AI)")
     ap.add_argument("--config", default=str(DEFAULT_CONFIG))
+    ap.add_argument("--repo", help="корень проекта (приоритет: --repo > DUO_REPO > ключ repo конфига > "
+                                   "автодетект от cwd)")
     sub = ap.add_subparsers(dest="cmd", required=True)
 
     def add_mode_flags(parser, *, with_solo: bool) -> None:
@@ -5316,12 +5673,12 @@ def main() -> None:
     p = sub.add_parser("claims", help="зоны записи работающих worktree-серий; --drop отпускает зону брошенной серии")
     p.add_argument("--task", help="показать/отпустить зону только этой серии")
     p.add_argument("--drop", action="store_true", help="отпустить зону серии --task (серия не должна быть запущена)")
-    p = sub.add_parser("gates", help="гейты поставки в чистой копии (git archive REF + заглушки gate_stubs): "
-                                     "ruff/mypy/lint-imports + pytest unit+arch/integration; rc≠0 при красном шаге")
+    p = sub.add_parser("gates", help="гейты поставки в чистой копии (git archive REF): шаги из gates.steps "
+                                     "конфига (плейсхолдеры {py}/{pybin}/{cpus}); rc≠0 при красном шаге")
     p.add_argument("--task", required=True)
     p.add_argument("--ref", help="что архивировать (по умолчанию duo/<task> для worktree-серий, иначе HEAD)")
     p.add_argument("--name", help="метка прогона (в имя каталога логов и summary)")
-    p.add_argument("--only", help="подмножество шагов через запятую: ruff,mypy,li,unit,integ")
+    p.add_argument("--only", help="подмножество шагов через запятую (имена из gates.steps конфига)")
     p.add_argument("--extra", nargs="+", metavar="PATH",
                    help="доп. файлы из основного дерева (незакоммиченное/неслитое), пути от корня repo")
     p.add_argument("--dry-run", action="store_true", help="только печать плана шагов и команд")
@@ -5341,11 +5698,31 @@ def main() -> None:
     p.add_argument("--print-digest-template", action="store_true",
                    help="напечатать заготовку дайджеста `### <task>` c механической подстановкой "
                         "(поля-суждения — <заполнить>); <заполнить> в индексе блокирует архивацию")
+    p = sub.add_parser("projects", help="реестр проектов для мультипроектного надзора (supervise без --repo)")
+    p.add_argument("--add", metavar="PATH", help="добавить проект в реестр")
+    p.add_argument("--remove", metavar="PATH", help="убрать проект из реестра")
+    p.add_argument("--prune", action="store_true", help="убрать проекты, каталогов которых больше нет")
+    p = sub.add_parser("setup", help="подключить проект: git init (по подтверждению), каркас .duo/config.json, "
+                                     "записи .gitignore, регистрация в реестре надзора")
+    p.add_argument("--yes", action="store_true",
+                   help="подтверждать неинтерактивно (напр., git init вне репозитория)")
+    p.add_argument("--no-register", action="store_true", help="не регистрировать проект в реестре надзора")
     sub.add_parser("selftest")
 
     args = ap.parse_args()
-    cfg = load_config(Path(args.config))
-    cfg["_config_path"] = str(Path(args.config).resolve())
+    # R1: корень проекта ДО сборки cfg — от него зависит проектный слой .duo/config.json
+    # (R2). Legacy-ключ `repo` читаем ТОЛЬКО из слоя --config: полный cfg собирается
+    # позже, а --repo/DUO_REPO приоритетнее.
+    config_path = Path(args.config)
+    legacy_repo = (_read_json_layer(config_path) or {}).get("repo")
+    repo_root: Path | None
+    if args.cmd == "projects":
+        repo_root = None                 # корень не нужен: таблица ходит по реестру
+    else:
+        repo_root = resolve_repo(flag=args.repo, legacy=legacy_repo, cmd=args.cmd)
+    cfg = load_config(config_path, repo=repo_root)
+    cfg["_config_path"] = str(config_path.resolve())
+    cfg["repo"] = str((repo_root or Path.cwd()).resolve())
 
     if args.cmd == "init":
         cmd_init(cfg, args)
@@ -5356,7 +5733,11 @@ def main() -> None:
     elif args.cmd == "wait":
         sys.exit(cmd_wait(cfg, args))
     elif args.cmd == "supervise":
-        cmd_supervise(cfg, args)
+        cmd_supervise(cfg, args, single=repo_root is not None)
+    elif args.cmd == "projects":
+        cmd_projects(cfg, args)
+    elif args.cmd == "setup":
+        cmd_setup(cfg, args, repo_root)
     elif args.cmd == "errata":
         cmd_errata(cfg, args)
     elif args.cmd == "run":

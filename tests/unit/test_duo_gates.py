@@ -2,6 +2,10 @@
 заглушки gate_stubs, падающие при импорте), DEPRECATED-пометка hold/release,
 подсказка гейтов в `merge --dry-run`, обратная совместимость конфига/соседних серий.
 
+R3 (duoportable): набор шагов и их argv — из gates.steps КОНФИГА (плейсхолдеры
+{py}/{pybin}/{cpus}); песочница _gcfg несёт пять vca-шагов ДОСЛОВНО из старого
+hardcode (байт-в-байт инвариант — test_gates_steps_from_config_byte_exact).
+
 Паттерн test_duo_pipev3/pipemodes: модуль оркестратора — importlib-ом, git-песочницы —
 в tmp_path, тяжёлые команды гейтов НЕ исполняются: раннер внедряется параметром
 `runner=` в cmd_gates (DI, как spawn/notify в supervise_tick) и возвращает canned
@@ -30,11 +34,37 @@ REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 STUBS = REPO_ROOT / "gate_stubs"
 STUB_PKGS = ("llama_cpp", "onnx", "onnxruntime", "pynvml", "torch")
 PYBIN = Path(sys.executable).resolve().parent
+PY = Path(sys.executable).resolve()   # {py} по умолчанию = sys.executable, резолвится
 
 
 def _gates_ns(task="demo", ref=None, name=None, only=None, extra=None, dry_run=False, keep=False):
     return argparse.Namespace(task=task, ref=ref, name=name, only=only, extra=extra,
                               dry_run=dry_run, keep=keep)
+
+
+def _vca_steps():
+    """Пять шагов vca — ДОСЛОВНО бывший hardcode gates_steps (бутстрап 5305210);
+    R3 переехал из кода в конфиг, регрессию держит test_gates_steps_from_config_byte_exact."""
+    return json.loads(json.dumps([
+        {"name": "ruff", "argv": ["{pybin}/ruff", "check", "."], "pp": False, "timeout": 900},
+        {"name": "mypy", "argv": ["{pybin}/mypy"], "pp": False, "timeout": 900},
+        {"name": "li", "argv": ["{pybin}/lint-imports"], "pp": False, "timeout": 900,
+         "summary": "contracts"},
+        {"name": "unit", "pp": True, "timeout": 7200,
+         "argv": ["env", "-u", "DATA_DIR", "-u", "LOG_DIR", "taskset", "-c", "{cpus}",
+                  "nice", "-n", "10", "{py}", "-m", "pytest", "tests/unit", "tests/arch"]},
+        {"name": "integ", "pp": True, "timeout": 7200,
+         "argv": ["env", "-u", "DATA_DIR", "-u", "LOG_DIR", "taskset", "-c", "{cpus}",
+                  "nice", "-n", "10", "{py}", "-m", "pytest", "-m", "integration and not gpu"]},
+    ]))
+
+
+def _gcfg(tmp_path: Path, repo: Path, **over) -> dict:
+    """cfg песочницы гейтов с vca-набором шагов в конфиге (R3)."""
+    cfg = _cfg(tmp_path, repo)
+    cfg["gates"] = {"cpus": "0-11", "steps": _vca_steps()}
+    cfg.update(over)
+    return cfg
 
 
 def _subdir(tmp_path: Path, name: str) -> Path:
@@ -89,12 +119,73 @@ def _last_log_dir(repo: Path, task="demo") -> Path:
     return logs[-1]
 
 
+# --- (а0) R3: шаги из конфига, байт-в-байт / пустой набор / стабы ------------------
+
+
+def test_gates_steps_from_config_byte_exact():
+    """R3-регрессия: конфиг с пятью шагами vca разрешается БАЙТ-В-БАЙТ как
+    захардкоженные в бутстрапе (5305210) gates_steps: argv/pp/timeout/summary.
+    {py} по умолчанию = sys.executable (gates.python не задан)."""
+    pinned = [
+        {"name": "ruff", "pp": False, "timeout": 900, "summary": "last_line",
+         "argv": [f"{PYBIN}/ruff", "check", "."]},
+        {"name": "mypy", "pp": False, "timeout": 900, "summary": "last_line",
+         "argv": [f"{PYBIN}/mypy"]},
+        {"name": "li", "pp": False, "timeout": 900, "summary": "contracts",
+         "argv": [f"{PYBIN}/lint-imports"]},
+        {"name": "unit", "pp": True, "timeout": 7200, "summary": "last_line",
+         "argv": ["env", "-u", "DATA_DIR", "-u", "LOG_DIR", "taskset", "-c", "0-11",
+                  "nice", "-n", "10", str(PY), "-m", "pytest",
+                  "tests/unit", "tests/arch"]},
+        {"name": "integ", "pp": True, "timeout": 7200, "summary": "last_line",
+         "argv": ["env", "-u", "DATA_DIR", "-u", "LOG_DIR", "taskset", "-c", "0-11",
+                  "nice", "-n", "10", str(PY), "-m", "pytest",
+                  "-m", "integration and not gpu"]},
+    ]
+    assert duo.gates_steps({"gates": {"cpus": "0-11", "steps": _vca_steps()}}) == pinned
+
+
+def test_gates_no_steps_rc2_hint(tmp_path: Path, capsys):
+    """R3: gates.steps не заданы → rc=2 и подсказка про .duo/config.json (не rc=0/трейсбек)."""
+    repo = _gate_repo(tmp_path)
+    assert duo.cmd_gates(_cfg(tmp_path, repo), _gates_ns()) == 2
+    out = capsys.readouterr().out
+    assert "gates.steps" in out and "PROJECT-SETUP.md" in out
+
+
+def test_gates_only_unknown_names_from_config(tmp_path: Path):
+    """--only валидируется по именам КОНФИГА (не по бывшему hardcode-набору)."""
+    repo = _gate_repo(tmp_path)
+    cfg = _gcfg(tmp_path, repo)
+    cfg["gates"]["steps"] = [{"name": "lint", "argv": ["{pybin}/ruff", "check", "."],
+                              "pp": False, "timeout": 60}]
+    with pytest.raises(SystemExit, match="допустимы \\['lint'\\]"):
+        duo.cmd_gates(cfg, _gates_ns(only="ruff"), runner=_fake_runner({}, []))
+
+
+def test_gates_stubs_disabled_and_custom(tmp_path: Path, capsys):
+    """R3: gates.stubs='' — заглушки не подмешиваются (PYTHONPATH=копия); путь —
+    используется и печатается в заголовке."""
+    repo = _gate_repo(tmp_path)
+    cfg = _gcfg(tmp_path, repo)
+    cfg["gates"]["stubs"] = ""
+    calls: list = []
+    assert duo.cmd_gates(cfg, _gates_ns(), runner=_fake_runner({}, calls)) == 0
+    assert calls[3]["env"]["PYTHONPATH"] == str(calls[3]["cwd"])   # unit: только копия
+    custom = _subdir(tmp_path, "mystubs")
+    capsys.readouterr()                                           # сброс: дальше только второй прогон
+    cfg2 = _gcfg(tmp_path, repo)
+    cfg2["gates"]["stubs"] = str(custom)
+    assert duo.cmd_gates(cfg2, _gates_ns(dry_run=True)) == 0
+    assert f"stubs={custom}" in capsys.readouterr().out.splitlines()[0]
+
+
 # --- (а) dry-run: план шагов и команд ---------------------------------------------
 
 
 def test_gates_dry_run_plan_and_commands(tmp_path: Path, capsys):
     repo = _gate_repo(tmp_path)
-    assert duo.cmd_gates(_cfg(tmp_path, repo), _gates_ns(dry_run=True)) == 0
+    assert duo.cmd_gates(_gcfg(tmp_path, repo), _gates_ns(dry_run=True)) == 0
     out = capsys.readouterr().out
     header = out.splitlines()[0]
     assert "task=demo" in header and "ref=duo/demo" in header and "cpus=0-11" in header
@@ -106,7 +197,7 @@ def test_gates_dry_run_plan_and_commands(tmp_path: Path, capsys):
     assert f"$ {PYBIN}/ruff check ." in out
     assert f"$ {PYBIN}/mypy" in out
     assert f"$ {PYBIN}/lint-imports" in out
-    wrap = f"env -u DATA_DIR -u LOG_DIR taskset -c 0-11 nice -n 10 {PYBIN}/python"
+    wrap = f"env -u DATA_DIR -u LOG_DIR taskset -c 0-11 nice -n 10 {PY}"
     assert f"$ {wrap} -m pytest tests/unit tests/arch" in out
     assert f"$ {wrap} -m pytest -m 'integration and not gpu'" in out
     unit_line = [ln for ln in out.splitlines() if "tests/unit tests/arch" in ln][0].split("$ ")[1]
@@ -121,10 +212,10 @@ def test_gates_dry_run_plan_and_commands(tmp_path: Path, capsys):
 def test_gates_ref_default_head_for_shared_and_override(tmp_path: Path, capsys):
     repo = _init_repo(tmp_path)                                # shared-серия: isolation в state нет
     _mk_task(repo, "demo")
-    assert duo.cmd_gates(_cfg(tmp_path, repo), _gates_ns(dry_run=True)) == 0
+    assert duo.cmd_gates(_gcfg(tmp_path, repo), _gates_ns(dry_run=True)) == 0
     assert "ref=HEAD" in capsys.readouterr().out.splitlines()[0]
     repo2 = _gate_repo(_subdir(tmp_path, "second"))
-    assert duo.cmd_gates(_cfg(tmp_path / "second", repo2), _gates_ns(ref="duo/demo", dry_run=True)) == 0
+    assert duo.cmd_gates(_gcfg(tmp_path / "second", repo2), _gates_ns(ref="duo/demo", dry_run=True)) == 0
     assert "ref=duo/demo" in capsys.readouterr().out.splitlines()[0]
 
 
@@ -132,14 +223,14 @@ def test_gates_missing_ref_refuses_before_steps(tmp_path: Path, capsys):
     repo = _gate_repo(tmp_path)
     calls: list = []
     with pytest.raises(SystemExit):
-        duo.cmd_gates(_cfg(tmp_path, repo), _gates_ns(ref="duo/nope"), runner=_fake_runner({}, calls))
+        duo.cmd_gates(_gcfg(tmp_path, repo), _gates_ns(ref="duo/nope"), runner=_fake_runner({}, calls))
     assert not calls                                            # ни одного шага не запущено
 
 
 def test_gates_cpus_from_config_and_compat(tmp_path: Path, capsys):
     repo = _gate_repo(tmp_path)
-    cfg = _cfg(tmp_path, repo)
-    cfg["gates"] = {"cpus": "4-5"}
+    cfg = _gcfg(tmp_path, repo)
+    cfg["gates"]["cpus"] = "4-5"
     assert duo.cmd_gates(cfg, _gates_ns(dry_run=True)) == 0
     out = capsys.readouterr().out
     assert out.count("taskset -c 4-5") == 2
@@ -149,7 +240,7 @@ def test_gates_cpus_from_config_and_compat(tmp_path: Path, capsys):
 def test_gates_only_filter_runs_subset(tmp_path: Path):
     repo = _gate_repo(tmp_path)
     calls: list = []
-    assert duo.cmd_gates(_cfg(tmp_path, repo), _gates_ns(only="ruff,unit"),
+    assert duo.cmd_gates(_gcfg(tmp_path, repo), _gates_ns(only="ruff,unit"),
                          runner=_fake_runner({}, calls)) == 0
     assert [_step_name(c["argv"]) for c in calls] == ["ruff", "unit"]
     assert sorted(p.name for p in _last_log_dir(repo).iterdir()) == ["ruff.txt", "summary.txt",
@@ -162,7 +253,7 @@ def test_gates_only_filter_runs_subset(tmp_path: Path):
 def test_gates_copy_from_ref_not_worktree(tmp_path: Path):
     repo = _gate_repo(tmp_path)
     calls: list = []
-    assert duo.cmd_gates(_cfg(tmp_path, repo), _gates_ns(), runner=_fake_runner({}, calls)) == 0
+    assert duo.cmd_gates(_gcfg(tmp_path, repo), _gates_ns(), runner=_fake_runner({}, calls)) == 0
     assert len(calls) == 5 and len({str(c["cwd"]) for c in calls}) == 1
     ls = calls[0]["ls"]
     assert "pyproject.toml" in ls and "feature.txt" in ls      # содержимое REF (ветки)
@@ -177,7 +268,7 @@ def test_gates_copy_from_ref_not_worktree(tmp_path: Path):
 def test_gates_extra_files_copied(tmp_path: Path):
     repo = _gate_repo(tmp_path)
     calls: list = []
-    assert duo.cmd_gates(_cfg(tmp_path, repo), _gates_ns(extra=["dirty.txt"]),
+    assert duo.cmd_gates(_gcfg(tmp_path, repo), _gates_ns(extra=["dirty.txt"]),
                          runner=_fake_runner({}, calls)) == 0
     assert "dirty.txt" in calls[0]["ls"]
     summary = (_last_log_dir(repo) / "summary.txt").read_text(encoding="utf-8")
@@ -206,7 +297,7 @@ def test_gate_stub_imports_fail():
 def test_gates_red_step_fails_and_summary(tmp_path: Path):
     repo = _gate_repo(tmp_path)
     calls: list = []
-    rc = duo.cmd_gates(_cfg(tmp_path, repo), _gates_ns(),
+    rc = duo.cmd_gates(_gcfg(tmp_path, repo), _gates_ns(),
                        runner=_fake_runner({"ruff": (1, "E1: что-то не так\n1 error")}, calls))
     assert rc == 1
     log = _last_log_dir(repo)
@@ -220,7 +311,7 @@ def test_gates_green_verbatim_pytest_tail(tmp_path: Path):
     repo = _gate_repo(tmp_path)
     results = {"unit": (0, "collected 12 items\n....\n12 passed in 3.4s\n"),
                "integ": (0, "3 passed in 1.1s\n"), "li": (0, "Contracts: 42 kept, 0 broken.\n")}
-    assert duo.cmd_gates(_cfg(tmp_path, repo), _gates_ns(),
+    assert duo.cmd_gates(_gcfg(tmp_path, repo), _gates_ns(),
                          runner=_fake_runner(results, [])) == 0
     summary = (_last_log_dir(repo) / "summary.txt").read_text(encoding="utf-8")
     assert re.search(r"unit rc=0 : 12 passed in 3\.4s$", summary, re.M)   # дословно
@@ -231,7 +322,7 @@ def test_gates_green_verbatim_pytest_tail(tmp_path: Path):
 def test_gates_empty_output_fallback_no_output(tmp_path: Path):
     """Эррата Е1: пустой вывод шага → «(no output)», не IndexError."""
     repo = _gate_repo(tmp_path)
-    assert duo.cmd_gates(_cfg(tmp_path, repo), _gates_ns(),
+    assert duo.cmd_gates(_gcfg(tmp_path, repo), _gates_ns(),
                          runner=_fake_runner({"ruff": (0, ""), "mypy": (0, "  \n")}, [])) == 0
     summary = (_last_log_dir(repo) / "summary.txt").read_text(encoding="utf-8")
     assert re.search(r"ruff rc=0 : \(no output\)$", summary, re.M)
@@ -243,7 +334,7 @@ def test_gates_empty_output_fallback_no_output(tmp_path: Path):
 
 def test_gates_temp_copy_removed_and_kept(tmp_path: Path, capsys):
     repo = _gate_repo(tmp_path)
-    cfg = _cfg(tmp_path, repo)
+    cfg = _gcfg(tmp_path, repo)
     calls: list = []
     assert duo.cmd_gates(cfg, _gates_ns(), runner=_fake_runner({}, calls)) == 0
     copy = calls[0]["cwd"]

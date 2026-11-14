@@ -207,12 +207,12 @@ def test_missing_impl_report_halts_to_needs_human(tmp_path: Path):
 # --- P8: симлинки provisioning не попадают в uncovered --------------------------
 
 
-def test_provision_link_targets_in_sync():
-    spec = importlib.util.spec_from_file_location("provision_worktree_under_test", PROVISION_PATH)
-    assert spec is not None and spec.loader is not None
-    mod = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(mod)
-    assert tuple(duo.PROVISION_LINK_TARGETS) == tuple(mod.LINK_TARGETS)
+def test_provision_script_has_no_hardcoded_targets():
+    """R4 (duoportable): набор имён уехал в argv (git.worktree_links конфига) —
+    в скрипте больше НЕТ константы LINK_TARGETS, модуль оркестратора тоже её не знает."""
+    src = PROVISION_PATH.read_text(encoding="utf-8")
+    assert "LINK_TARGETS" not in src
+    assert not hasattr(duo, "PROVISION_LINK_TARGETS")
 
 
 def test_collect_commit_groups_ignores_provisioning_symlinks(tmp_path: Path):
@@ -232,14 +232,19 @@ def test_collect_commit_groups_ignores_provisioning_symlinks(tmp_path: Path):
     (td / "impl_report_v1.md").write_text(
         "## commit_plan\n\n| группа | файлы (glob) | сообщение | rationale |\n|---|---|---|---|\n"
         "| G1 | README.md | fix: правка | п.1 |\n", encoding="utf-8")
-    snap = duo.collect_commit_groups(repo, td, 1, "pipeline/demo")
+    # R4: имена передаются параметром (раньше — глобальная константа в duo_pipeline)
+    links = ("data", "models", "node_modules")
+    snap = duo.collect_commit_groups(repo, td, 1, "pipeline/demo", links)
     assert snap["uncovered"] == ["models_notes.txt"]           # реальный файл виден
-    for name in ("data", "models", "node_modules"):
+    for name in links:
         assert name not in snap["changed"]
+    # БЕЗ имён те же корневые симлинки — обычный untracked (фильтр не слеп)
+    snap2 = duo.collect_commit_groups(repo, td, 1, "pipeline/demo")
+    assert set(links) <= set(snap2["changed"])
     # настоящий каталог с таким именем (не симлинк) фильтром НЕ скрывается
     (repo / "docs_real").mkdir()
-    assert not duo.is_provisioned_symlink(repo, "docs_real")
-    assert duo.is_provisioned_symlink(repo, "models")
+    assert not duo.is_provisioned_symlink(repo, "docs_real", links)
+    assert duo.is_provisioned_symlink(repo, "models", links)
     assert not os.path.islink(repo / "README.md")
 
 

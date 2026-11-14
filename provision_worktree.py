@@ -1,16 +1,18 @@
 #!/usr/bin/env python3
 """provision_worktree.py — provisioning git-worktree серии (pipev3 P2/B1).
 
-Симлинкает тяжёлые untracked-ресурсы основного дерева (data/, models/,
-node_modules/) в свежий worktree: git их не переносит, а серия ожидает
-окружение основного дерева. `.env` НЕ симлинкуется (секреты; изоляция
+Симлинкает тяжёлые untracked-ресурсы основного дерева (имена передаются
+в argv — оркестратор берёт их из `git.worktree_links` конфига проекта)
+в свежий worktree: git их не переносит, а серия ожидает окружение
+основного дерева. `.env` НЕ симлинкуется (секреты; изоляция
 тестов — conftest, а не общий .env).
 
 Контракт fail-closed: цель, которую нельзя разрешить (путь в worktree занят
 не-симлинком, симлинк указывает не туда, worktree не git-worktree), —
 nonzero exit, и вызывающий дуо-пайплайн НЕ стартует серию. Отсутствие
 ресурса в основном дереве — не ошибка (в этой среде его может не быть).
-Идемпотентен: повторный прогон по готовому worktree ничего не меняет.
+Без имён — «нечего линковать», rc=0. Идемпотентен: повторный прогон по
+готовому worktree ничего не меняет.
 
 Вызов: duo_pipeline.py Pipeline._ensure_worktree при каждом запуске серии
 (git.isolation=worktree). Юниты: tests/unit/test_duo_pipev3.py.
@@ -21,10 +23,9 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
-# Тяжёлые untracked-ресурсы dev-клона (см. CLAUDE.md: data/, models/ —
-# симлинки в dev, маунт в prod; node_modules — сборка UI). Расширение —
-# правкой списка, новые ресурсы появляются редко.
-LINK_TARGETS = ("data", "models", "node_modules")
+# Секреты не симлинкуются НИ ПРИ КАКИХ именах — даже если конфиг ошибочно включил
+# (изоляция тестов — conftest, а не общий .env; инвариант прежних версий скрипта).
+NEVER_LINK = {".env"}
 
 
 def fail(msg: str) -> int:
@@ -33,11 +34,13 @@ def fail(msg: str) -> int:
 
 
 def main() -> int:
-    if len(sys.argv) != 3:
-        print("использование: provision_worktree.py <основное-дерево> <worktree>", file=sys.stderr)
+    if len(sys.argv) < 3:
+        print("использование: provision_worktree.py <основное-дерево> <worktree> [имя ...]",
+              file=sys.stderr)
         return 2
     repo = Path(sys.argv[1]).resolve()
     wt = Path(sys.argv[2]).resolve()
+    names = [a for a in sys.argv[3:] if a and a not in NEVER_LINK]
     if not repo.is_dir():
         return fail(f"основное дерево не найдено: {repo}")
     if not (wt / ".git").exists():
@@ -45,7 +48,7 @@ def main() -> int:
     if repo == wt:
         return fail("worktree совпадает с основным деревом")
     linked: list[str] = []
-    for name in LINK_TARGETS:
+    for name in names:
         src = repo / name
         dst = wt / name
         if not src.exists():

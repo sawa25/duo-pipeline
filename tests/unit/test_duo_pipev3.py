@@ -708,6 +708,7 @@ def test_worktree_provisioning_env_error_fail_closed(tmp_path: Path):
     _mk_task(repo)
     cfg = _cfg(tmp_path, repo)
     cfg["git"]["isolation"] = "worktree"
+    cfg["git"]["worktree_links"] = ["data"]              # R4: имена — из конфига проекта
     p = duo.Pipeline(cfg, "demo")
     st = p.load_state()
     p._ensure_worktree(st)
@@ -736,6 +737,7 @@ def test_shared_mode_is_untouched(tmp_path: Path):
 
 
 def test_provision_success_idempotent_fail_closed(tmp_path: Path):
+    """R4: имена ресурсов — argv скрипта (оркестратор берёт их из git.worktree_links)."""
     repo = _init_repo(tmp_path)
     (repo / "data").mkdir()
     (repo / "data" / "f.bin").write_text("x", encoding="utf-8")
@@ -743,13 +745,20 @@ def test_provision_success_idempotent_fail_closed(tmp_path: Path):
     _git(repo, "worktree", "add", str(repo / ".worktrees" / "demo"), "-b", "duo/demo", _head(repo))
     wt = repo / ".worktrees" / "demo"
     import subprocess
-    r = subprocess.run([sys.executable, str(PROVISION_PATH), str(repo), str(wt)],
+    # без имён — «нечего линковать», rc=0
+    r0 = subprocess.run([sys.executable, str(PROVISION_PATH), str(repo), str(wt)],
+                        capture_output=True, text=True)
+    assert r0.returncode == 0 and "нечего линковать" in r0.stdout
+    assert not (wt / "data").exists()
+    # с именами — симлинк; повтор идемпотентен
+    names = [str(repo), str(wt), "data"]
+    r = subprocess.run([sys.executable, str(PROVISION_PATH), *names],
                        capture_output=True, text=True)
     assert r.returncode == 0, r.stderr
     assert (wt / "data").is_symlink()
-    # .env НЕ симлинкуется даже если есть в основном дереве
+    # .env НЕ симлинкуется НИКОГДА — даже переданный явно (секреты; инвариант скрипта)
     (repo / ".env").write_text("SECRET=1", encoding="utf-8")
-    r2 = subprocess.run([sys.executable, str(PROVISION_PATH), str(repo), str(wt)],
+    r2 = subprocess.run([sys.executable, str(PROVISION_PATH), str(repo), str(wt), "data", ".env"],
                         capture_output=True, text=True)
     assert r2.returncode == 0                            # идемпотентен
     assert not (wt / ".env").exists()
@@ -757,15 +766,19 @@ def test_provision_success_idempotent_fail_closed(tmp_path: Path):
     (wt / "models").mkdir()
     (repo / "models").mkdir()
     (repo / "models" / "m.bin").write_text("m", encoding="utf-8")
-    r3 = subprocess.run([sys.executable, str(PROVISION_PATH), str(repo), str(wt)],
+    r3 = subprocess.run([sys.executable, str(PROVISION_PATH), str(repo), str(wt), "models"],
                         capture_output=True, text=True)
     assert r3.returncode != 0 and "не симлинк" in (r3.stderr + r3.stdout)
     # не-worktree — отказ
     fake = tmp_path / "fake_wt"
     fake.mkdir()
-    r4 = subprocess.run([sys.executable, str(PROVISION_PATH), str(repo), str(fake)],
+    r4 = subprocess.run([sys.executable, str(PROVISION_PATH), str(repo), str(fake), "data"],
                         capture_output=True, text=True)
     assert r4.returncode != 0
+    # неверный argv (без имён и без worktree) — usage rc=2
+    r5 = subprocess.run([sys.executable, str(PROVISION_PATH), str(repo)],
+                        capture_output=True, text=True)
+    assert r5.returncode == 2 and "использование" in r5.stderr
 
 
 # --- pipev4: П3 guard артефакта, П2 prereg-блок, П5 эскалация ------------------

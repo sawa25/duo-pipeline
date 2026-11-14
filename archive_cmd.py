@@ -43,21 +43,46 @@ MANIFEST_NAME = "MANIFEST.tsv"
 MANIFEST_HEADER = "name\tfiles\traw_bytes\ttar_bytes\tsha256"
 ZSTD_ARGS = ("-T0", "-6", "-q")          # уровень/потоки как в make_snapshots.sh (-T4 -6 -q)
 
-# Зеркало охранного теста tests/arch/test_archived_series_refs.py (дрейф ловит
-# test_guard_constants_in_sync): та же семантика поиска указателей на серию вне pipeline/.
-GUARD_SKIP_DIRS = {
-    "pipeline", ".git", ".worktrees", "node_modules", "data", "models", "dist",
-    "__pycache__", ".ruff_cache", ".mypy_cache", ".pytest_cache",
-    ".venv", "venv", "build", "vca_platform.egg-info",
+# R6 (duoportable): охранный обход конфигурируем. Встроенный набор — нейтральные
+# служебные каталоги любого git-проекта; vca-специфика (data, models, egg-info,
+# doc/99-TODO.md, a3_registry.json) живёт в archive.guard_skip_dirs /
+# archive.guard_exempt_files конфига ПРОЕКТА (.duo/config.json) и ДОПОЛНЯЕТ builtin.
+GUARD_SKIP_DIRS_BUILTIN = {
+    ".git", ".worktrees", "node_modules", "dist", "build", "__pycache__",
+    ".ruff_cache", ".mypy_cache", ".pytest_cache", ".venv", "venv",
 }
-GUARD_EXEMPT_FILES = {"doc/99-TODO.md", "tests/fixtures/mocalib_a3/a3_registry.json"}
+GUARD_SKIP_DIRS = set(GUARD_SKIP_DIRS_BUILTIN) | {"pipeline"}   # дефолт прямых вызовов
+GUARD_EXEMPT_FILES_BUILTIN: set[str] = set()
+GUARD_EXEMPT_FILES = set(GUARD_EXEMPT_FILES_BUILTIN)
+
+
+def guard_sets(cfg: dict) -> tuple[set[str], set[str]]:
+    """Эффективные наборы охранного обхода для репозитория с этим cfg: builtin ∪
+    значения конфига ∪ каталог артефактов (сам pipeline/ всегда вне скана)."""
+    arc = cfg.get("archive") or {}
+    skip = set(GUARD_SKIP_DIRS_BUILTIN) | {str(d) for d in arc.get("guard_skip_dirs") or []}
+    arts = str(cfg.get("artifacts_dir") or "pipeline").strip("/")
+    skip.add(arts or "pipeline")
+    exempt = set(GUARD_EXEMPT_FILES_BUILTIN) | {str(f) for f in arc.get("guard_exempt_files") or []}
+    return skip, exempt
 GUARD_BINARY_SUFFIXES = {
     ".png", ".jpg", ".jpeg", ".gif", ".pdf", ".bin", ".zst", ".zip", ".tar",
     ".gz", ".ico", ".woff", ".woff2", ".mp4", ".onnx", ".gguf",
 }
 GUARD_ENV_FILENAMES = {".env"}           # + .env.bak* — локальные бэкапы машины, не источники
 INDEX_LINK_RE = re.compile(r"pipeline/ARCHIVE-INDEX\.md#\w+")   # легальная ссылка на архив
-MERGE_TARGET_REFS = ("HEAD", "main", "dev/speedlim")
+# Куда должна быть слита ветка серии, чтобы её можно было архивировать. Встроенный набор
+# нейтрален; ветки конкретного проекта — `archive.merge_target_refs` в .duo/config.json.
+MERGE_TARGET_REFS = ("HEAD", "main")
+
+
+def merge_target_refs(cfg: dict) -> tuple[str, ...]:
+    """Эффективные ссылки слияния: builtin ∪ archive.merge_target_refs (без дублей, по порядку)."""
+    out = list(MERGE_TARGET_REFS)
+    for ref in (cfg.get("archive") or {}).get("merge_target_refs") or []:
+        if isinstance(ref, str) and ref and ref not in out:
+            out.append(ref)
+    return tuple(out)
 
 
 class ArchiveError(RuntimeError):
@@ -164,22 +189,27 @@ def _refs_pattern(names: list[str]) -> re.Pattern[str]:
     return re.compile(rf"pipeline/({alts})(/|\b)")
 
 
-def scan_series_refs(repo: Path, names: list[str]) -> dict[str, list[str]]:
+def scan_series_refs(repo: Path, names: list[str], *, skip_dirs: set[str] | None = None,
+                     exempt_files: set[str] | None = None) -> dict[str, list[str]]:
     """Указатели `pipeline/<имя>` ВНЕ pipeline/ с семантикой охранного теста: один os.walk
     на все имена сразу (для --list), вырезание легальных ссылок ARCHIVE-INDEX.md#…,
-    исключения EXEMPT_FILES/.env*/бинарных суффиксов. Возвращает {имя: [файлы]}."""
+    исключения exempt/.env*/бинарных суффиксов. Наборы каталогов/файлов-исключений —
+    R6 (guard_sets(cfg)); по умолчанию — модульные GUARD_SKIP_DIRS/GUARD_EXEMPT_FILES.
+    Возвращает {имя: [файлы]}."""
     hits: dict[str, set[str]] = {n: set() for n in names}
     if not names:
         return {n: sorted(v) for n, v in hits.items()}
+    skip = GUARD_SKIP_DIRS if skip_dirs is None else skip_dirs
+    exempt = GUARD_EXEMPT_FILES if exempt_files is None else exempt_files
     pattern = _refs_pattern(names)
     for dirpath, dirnames, filenames in os.walk(repo):
-        dirnames[:] = [d for d in dirnames if d not in GUARD_SKIP_DIRS]
+        dirnames[:] = [d for d in dirnames if d not in skip]
         for fname in filenames:
             fpath = Path(dirpath) / fname
             rel = fpath.relative_to(repo).as_posix()
             if _is_local_env(fname):
                 continue
-            if rel in GUARD_EXEMPT_FILES or fpath.suffix.lower() in GUARD_BINARY_SUFFIXES:
+            if rel in exempt or fpath.suffix.lower() in GUARD_BINARY_SUFFIXES:
                 continue
             try:
                 text = fpath.read_text(encoding="utf-8")
@@ -244,10 +274,10 @@ def merged_age_days(st: dict, repo: Path, branch: str) -> tuple[int | None, str]
     return None, "дата слияния не распознана (нет state.merged.at и валидного tip ветки)"
 
 
-def merged_into(repo: Path, branch: str) -> list[str]:
-    """Существующие ссылки из [HEAD, main, dev/speedlim], содержащие ветку серии целиком."""
+def merged_into(repo: Path, branch: str, refs: tuple[str, ...] | None = None) -> list[str]:
+    """Существующие ссылки из refs (по умолчанию HEAD, main), содержащие ветку серии целиком."""
     out = []
-    for ref in MERGE_TARGET_REFS:
+    for ref in (refs or MERGE_TARGET_REFS):
         rc, _ = _sh(["git", "merge-base", "--is-ancestor", f"refs/heads/{branch}", ref], cwd=repo)
         if rc == 0:
             out.append(ref)
@@ -271,14 +301,17 @@ def admission(cfg: dict, repo: Path, task: str, min_age_days: int = DEFAULT_MIN_
     branch = f"{p['branch_prefix']}{task}"
     st = _load_json(task_dir / "state.json")
     m = st.get("merged") if isinstance(st.get("merged"), dict) else None
-    into = merged_into(repo, branch)
+    targets = merge_target_refs(cfg)
+    into = merged_into(repo, branch, targets)
     age_days, age_src = merged_age_days(st, repo, branch)
     worktree = (repo / p["worktrees_dir"] / task / ".git").exists()
     busy = lock_held(task_dir)
     dig = digest_section(p["index"], task)
     digest_state = "нет" if dig is None else ("черновик" if PLACEHOLDER in dig else "готов")
     tracked = _tracked_files(repo, p["arts_rel"], task)
-    refs = scan_series_refs(repo, [task])[task] if refs is None else refs
+    if refs is None:
+        skip, exempt = guard_sets(cfg)
+        refs = scan_series_refs(repo, [task], skip_dirs=skip, exempt_files=exempt)[task]
 
     facts = {"phase": st.get("phase") or "—",
              "age_days": age_days, "age_src": age_src, "into": into, "worktree": worktree,
@@ -286,7 +319,7 @@ def admission(cfg: dict, repo: Path, task: str, min_age_days: int = DEFAULT_MIN_
     reasons: list[str] = []
     if not m and not into:
         reasons.append(f"серия не слита: нет state.merged и ветка {branch} не предок "
-                       f"{'/'.join(MERGE_TARGET_REFS)}")
+                       f"{'/'.join(targets)}")
     if age_days is None:
         reasons.append(f"возраст слияния недоказуем ({age_src})")
     elif age_days < min_age_days and not force_young:
@@ -475,7 +508,8 @@ def digest_template(cfg: dict, repo: Path, task: str) -> str:
         src = f"слита в {', '.join(into)} (state.merged нет — даты из git)"
     else:
         src = PLACEHOLDER
-    refs = scan_series_refs(repo, [task])[task]
+    _skip, _exempt = guard_sets(cfg)
+    refs = scan_series_refs(repo, [task], skip_dirs=_skip, exempt_files=_exempt)[task]
     refs_txt = "нет" if not refs else f"{len(refs)} попаданий: {', '.join(refs[:5])}"
     return (f"### {task}\n"
             f"* **Тема / даты:** {_task_title(task_dir)} · {dates}\n"
@@ -534,7 +568,8 @@ def _cmd_list(cfg: dict, args) -> int:
         if not child.is_dir():
             continue
         names.append(child.name)
-    refs_map = scan_series_refs(p["repo"], names)
+    skip, exempt = guard_sets(cfg)
+    refs_map = scan_series_refs(p["repo"], names, skip_dirs=skip, exempt_files=exempt)
     print(f"{'задача':<14} {'фаза':<10} {'дн':>4} {'слита в':<16} {'wt':<4} {'lock':<5} "
           f"{'дайджест':<8} {'ссылки':>6}  вердикт")
     for name in names:
@@ -683,8 +718,8 @@ def _cmd_task(cfg: dict, args) -> int:
         print(f"  снимок:    {tar_zst}")
         print(f"  манифест:  {root / MANIFEST_NAME}")
         print(f"  ветка {p['branch_prefix']}{task} сохранена (не тронута)")
-        print(f"далее (человек): указатели в doc/99-TODO.md → pipeline/ARCHIVE-INDEX.md#{task}; "
-              f"коммит staged-удалений; гейты (make unit / lint)")
+        print(f"далее (человек): переведи оставшиеся указатели на серию в коде/доках на "
+              f"pipeline/ARCHIVE-INDEX.md#{task}; коммит staged-удалений; гейты (make unit / lint)")
         print("КОММИТ ДЕЛАЕТ ЧЕЛОВЕК: инструмент ничего не коммитит")
         return 0
     finally:
