@@ -36,8 +36,8 @@
 скармливать `notify_on_output` (паттерн `WAIT-RESULT`), а в обычном режиме — блокирующим вызовом:
 
 ```bash
-cd /home/sawa/GitHub/vca-platform
-conda run -n env311 python tools/dev/duo_pipeline/duo_pipeline.py wait --task <task> --poll 30
+cd /home/sawa/GitHub/<проект>
+duo wait --task <task> --poll 30
 # фон + событийный сигнал агенту:  notify_on_output pattern "WAIT-RESULT|Error|Traceback"
 ```
 
@@ -54,10 +54,10 @@ conda run -n env311 python tools/dev/duo_pipeline/duo_pipeline.py wait --task <t
 Установка (идемпотентно; заменяет и снимает старый `duo-watchdog-failsafe.timer`):
 
 ```bash
-bash /home/sawa/GitHub/vca-platform/tools/dev/duo_pipeline/systemd/install.sh
+bash /home/sawa/GitHub/duo-pipeline/systemd/install.sh
 journalctl --user -u duo-supervise.service -n 5 --no-pager      # вывод последнего тика
 systemctl --user list-timers 'duo-supervise*' --no-pager        # следующее срабатывание
-python tools/dev/duo_pipeline/duo_pipeline.py supervise --dry-run   # что сделал бы надзор (ничего не меняет)
+duo supervise --dry-run   # что сделал бы надзор (ничего не меняет; без --repo — по реестру проектов)
 ```
 
 Свойства:
@@ -74,19 +74,19 @@ python tools/dev/duo_pipeline/duo_pipeline.py supervise --dry-run   # что с�
   `dead_max_age_sec` (сутки: давние «трупы» и ни разу не запускавшиеся серии — `idle`, не тревога);
 - автопродолжение `impl_pending` **не делается**: запуск имплементации — решение эксперта после приёмки плана.
 
-Без systemd: `setsid nohup bash tools/dev/duo_pipeline/watchdog.sh >/dev/null 2>&1 &` (тонкая обёртка над
-`supervise --loop --interval 60`) либо cron `*/2 * * * * … duo_pipeline.py supervise`.
+Без systemd: `setsid nohup duo supervise --loop --interval 60 >/dev/null 2>&1 &`
+либо cron `*/2 * * * * … duo supervise`.
 
 ## Что делать при остановке (шпаргалка помощника)
 
 ```bash
-python tools/dev/duo_pipeline/duo_pipeline.py status --task X          # halt.kind, stop_reason, процесс
-python tools/dev/duo_pipeline/duo_pipeline.py run --task X --resume    # transport / crash / artifact_missing
-python tools/dev/duo_pipeline/duo_pipeline.py run --task X --resume --add-iterations 3   # limit
-python tools/dev/duo_pipeline/duo_pipeline.py run --task X --resume --add-budget 40      # budget
+duo status --task X          # halt.kind, stop_reason, процесс
+duo run --task X --resume    # transport / crash / artifact_missing
+duo run --task X --resume --add-iterations 3   # limit
+duo run --task X --resume --add-budget 40      # budget
 ```
 
-Подробно по видам остановок — `pipeline/CHEATSHEET-CONTROL.md` («Остановки»).
+Подробно по видам остановок — `docs/CHEATSHEET-CONTROL.md` («Остановки»).
 
 ## Если сломалось
 

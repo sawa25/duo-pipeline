@@ -1,8 +1,32 @@
-# Шпаргалка 1: управление duo-пайплайном (pipev5 + pipemodes)
+# Шпаргалка 1: управление duo-пайплайном (pipev5 + pipemodes + duoportable)
 
-Оркестратор: `tools/dev/duo_pipeline/duo_pipeline.py` (конфиг `config.json`
-рядом). Артефакты каждой серии: `pipeline/<task>/`. Полный формат —
-`CLAUDE.md` (раздел «Дуо-пайплайн»); здесь — рабочие команды без воды.
+Оркестратор: `/home/sawa/GitHub/duo-pipeline/duo_pipeline.py` (конфиг —
+`config.json` инструмента + `.duo/config.json` подключённого проекта).
+Артефакты каждой серии: `pipeline/<task>/` В САМОМ ПРОЕКТЕ. Ниже `duo` —
+вызов оркестратора (alias/symlink; развёрнуто —
+`python /home/sawa/GitHub/duo-pipeline/duo_pipeline.py <команда>`).
+Полный формат — `CLAUDE.md` репозитория инструмента; подключение проектов и
+ключи `.duo/config.json` — `docs/PROJECT-SETUP.md`; здесь — рабочие команды
+без воды.
+
+## Запуск из любого проекта (duoportable)
+
+- **Корень проекта (R1)**: `--repo PATH` > `DUO_REPO` > legacy-ключ `repo`
+  конфига `--config` > автодетект от cwd (из любого подкаталога и linked
+  worktree). Обычно достаточно запустить команду из каталога проекта.
+  `duo setup` в каталоге проекта подключает его (каркас `.duo/config.json`,
+  записи `.gitignore`, регистрация в реестре надзора).
+- **Конфиг (R2)**: `DEFAULTS < config.json инструмента < <проект>/.duo/config.json`;
+  списки замещаются целиком; пути терпят `~`/`$VAR`.
+- **Гейты (R3)**: шаги `gates.steps` проектного конфига (`{py}/{pybin}/{cpus}`);
+  `duo gates --task X` гоняет их в чистой копии. Пример набора — vca в
+  `docs/PROJECT-SETUP.md`.
+- **Надзор (R8)**: `duo supervise` без явного корня обходит РЕЕСТР проектов
+  (`duo projects` — таблица/`--add/--remove/--prune`); уведомления помечены
+  `duo <проект>/<task>`. С явным `--repo`/`DUO_REPO` — один проект.
+- **Worktree-ресурсы (R4/R7)**: `git.worktree_links` — что симлинкается в
+  worktree (`.env` — никогда); `executor_worktree_note` — приписка «не
+  перезапускать X» в промпт исполнителя.
 
 ## Три режима серии
 
@@ -21,9 +45,9 @@
 ## Режим pair: исполнитель + один проверяющий
 
 ```bash
-python tools/dev/duo_pipeline/duo_pipeline.py init --task <name> --mode pair     # или передать --mode pair в run
-python tools/dev/duo_pipeline/duo_pipeline.py run --task <name>                  # стадия «план»: пока проверяющий не примет
-python tools/dev/duo_pipeline/duo_pipeline.py run --task <name> --continue       # стадия «код»: пока проверяющий не примет
+duo init --task <name> --mode pair     # или передать --mode pair в run
+duo run --task <name>                  # стадия «план»: пока проверяющий не примет
+duo run --task <name> --continue       # стадия «код»: пока проверяющий не примет
 ```
 
 - Стадии те же, что в duo: план (`plan_vN.md`) → пауза `impl_pending` → код (`impl_report_vN.md` + дифф);
@@ -45,15 +69,15 @@ python tools/dev/duo_pipeline/duo_pipeline.py run --task <name> --continue      
 ## Полный цикл (исполнитель ↔ дуо-надсмотрщик, модель glm-5.3)
 
 ```bash
-cd /home/sawa/GitHub/vca-platform && conda activate env311
+cd /home/sawa/GitHub/<проект>        # любой проект, подключённый `duo setup` (или автодетект корня)
 # 1. создать задачу (task.md положить/написать в pipeline/<task>/)
-python tools/dev/duo_pipeline/duo_pipeline.py init --task <name>
+duo init --task <name>
 # 2. запустить (detached — переживает терминал; ветка duo/<name> сама)
-python tools/dev/duo_pipeline/duo_pipeline.py run --task <name>
+duo run --task <name>
 # 3. после ACCEPT плана — продолжить в имплементацию
-python tools/dev/duo_pipeline/duo_pipeline.py run --task <name> --continue
+duo run --task <name> --continue
 # 4. после ACCEPT имплементации — разложить коммиты по commit_plan
-python tools/dev/duo_pipeline/duo_pipeline.py commit-by-plan --task <name> --yes
+duo commit-by-plan --task <name> --yes
 ```
 
 ## Упрощённый solo-режим (дешёвая модель glm-5.3-flash, БЕЗ плана и ревью)
@@ -61,8 +85,8 @@ python tools/dev/duo_pipeline/duo_pipeline.py commit-by-plan --task <name> --yes
 Для артефактных/измерительных задач, где дорогое планирование избыточно.
 
 ```bash
-python tools/dev/duo_pipeline/duo_pipeline.py init --task <name>   # task.md обязателен
-python tools/dev/duo_pipeline/duo_pipeline.py run --task <name> --solo
+duo init --task <name>   # task.md обязателен
+duo run --task <name> --solo
 ```
 
 Как работает:
@@ -90,14 +114,14 @@ python tools/dev/duo_pipeline/duo_pipeline.py run --task <name> --solo
 
 ```bash
 # терминалы/вызовы claude-glm из IDE — по одному на серию:
-python tools/dev/duo_pipeline/duo_pipeline.py init --task a --mode pair --worktree
-python tools/dev/duo_pipeline/duo_pipeline.py run --task a                 # план → impl_pending
-python tools/dev/duo_pipeline/duo_pipeline.py run --task b --mode pair --worktree
-python tools/dev/duo_pipeline/duo_pipeline.py claims                       # кто какие файлы занимает
-python tools/dev/duo_pipeline/duo_pipeline.py run --task a --continue      # имплементация (занимает зону)
-python tools/dev/duo_pipeline/duo_pipeline.py commit-by-plan --task a --yes # коммиты в ветку duo/a (в worktree)
-python tools/dev/duo_pipeline/duo_pipeline.py merge --task a --dry-run     # что войдёт, будут ли конфликты
-python tools/dev/duo_pipeline/duo_pipeline.py merge --task a               # влить duo/a → текущая ветка основного дерева
+duo init --task a --mode pair --worktree
+duo run --task a                 # план → impl_pending
+duo run --task b --mode pair --worktree
+duo claims                       # кто какие файлы занимает
+duo run --task a --continue      # имплементация (занимает зону)
+duo commit-by-plan --task a --yes # коммиты в ветку duo/a (в worktree)
+duo merge --task a --dry-run     # что войдёт, будут ли конфликты
+duo merge --task a               # влить duo/a → текущая ветка основного дерева
 ```
 
 **Как предотвращаются коллизии (не магия, а три слоя):**
@@ -130,9 +154,11 @@ python tools/dev/duo_pipeline/duo_pipeline.py merge --task a               # в�
 
 **Что НЕ защищено (важно):**
 
-- Общие ресурсы вне git: API-сервер `:8001` (исполнитель в worktree-серии получает запрет его перезапускать), GPU,
-  `data/`, `models/`, `node_modules` (симлинки из основного дерева — запись в них идёт в ОБЩИЕ данные), общая
-  БД и очереди. Серии, которые тестируют на живом `:8001`/GPU/боевой `data/vca.db`, параллелить нельзя.
+- Общие ресурсы вне git: сервисы проекта (какой не перезапускать — задаёт
+  `executor_worktree_note` в `.duo/config.json`; в vca это API-сервер `:8001`), GPU,
+  каталоги из `git.worktree_links` (`data/`, `models/`, `node_modules` — симлинки
+  из основного дерева, запись в них идёт в ОБЩИЕ данные), общая
+  БД и очереди. Серии, которые тестируют на живом сервисе/GPU/боевой базе, параллелить нельзя.
 - В worktree попадает только ЗАКОММИЧЕННОЕ: незакоммиченные правки основного дерева серия не видит (а merge
   ждёт чистый worktree серии — коммит через `commit-by-plan`).
 - Зона — заявление исполнителя: слишком узкая зона пропустит конфликтную серию (конфликт всплывёт на `merge`
@@ -142,14 +168,15 @@ python tools/dev/duo_pipeline/duo_pipeline.py merge --task a               # в�
   не проверяются claim-gate (остаётся обычный `git merge`).
 - Изоляция серии не меняется после первого запуска (`ОТКАЗ … сменить нельзя`); начни новую серию.
 
-Сделать worktree умолчанием для всех новых серий: `config.json` → `git.isolation: "worktree"` (флаг
+Сделать worktree умолчанием для всех новых серий: `.duo/config.json` проекта (или
+`config.json` инструмента) → `git.isolation: "worktree"` (флаг
 `--worktree` тогда не нужен; серии `shared`, уже запущенные раньше, продолжат как shared благодаря пину).
 Пока умолчание — `shared` (прежнее поведение).
 
 ## Разовое дуо-ревью произвольного артефакта (консилиум)
 
 ```bash
-python tools/dev/duo_pipeline/duo_pipeline.py review --task <name> \
+duo review --task <name> \
   --artifact pipeline/<name>/decision_briefing.md --phase custom
 # отчёт: pipeline/<name>/rev{NNN}_custom.md; вердикт в последней строке
 ```
@@ -249,10 +276,10 @@ detached. Отказы: живой процесс (`.lock`), `phase=done` без
 | события серии (фазы, вердикты) | `tail -f pipeline/<task>/orchestrator.log` |
 | живая консоль исполнителя (каждая команда) | `tail -f pipeline/<task>/orchestrator_bg.log` |
 | состояние (phase, счётчики, $) | `pipeline/<task>/state.json` |
-| сводка по всем сериям (+ процесс: running/dead/halted…, колонка `режим`: `pair/wt`, `duo/sh`, `—/—` у старых) | `python .../duo_pipeline.py status --all` |
-| зоны записи worktree-серий и их пересечения | `python .../duo_pipeline.py claims [--task X]` |
-| ждать остановки/приёмки (для агента/скрипта) | `python .../duo_pipeline.py wait --task X` → `WAIT-RESULT: …`, код 0/10/11/12/13 |
-| надзор (алерты, авто-возобновление, уведомления) | `systemd --user`: `duo-supervise.timer` (раз в 2 мин) — см. `pipeline/CHEATSHEET-WATCHDOG-FAILSAFE.md` |
+| сводка по всем сериям (+ процесс: running/dead/halted…, колонка `режим`: `pair/wt`, `duo/sh`, `—/—` у старых) | `duo status --all` |
+| зоны записи worktree-серий и их пересечения | `duo claims [--task X]` |
+| ждать остановки/приёмки (для агента/скрипта) | `duo wait --task X` → `WAIT-RESULT: …`, код 0/10/11/12/13 |
+| надзор (алерты, авто-возобновление, уведомления) | `systemd --user`: `duo-supervise.timer` (раз в 2 мин; без `--repo` — по реестру проектов) — см. `docs/CHEATSHEET-WATCHDOG-FAILSAFE.md` |
 
 Старый `watchdog.sh` (живой bash-цикл) и `watchdog_failsafe.sh` **выведены** (pipework3): штатный надзор —
 `duo_pipeline.py supervise` (источник истины — state + `flock` на `.lock`, не `ps`/`pgrep`). Автопродолжение
@@ -366,22 +393,23 @@ merge --no-ff в feature-ветку → push → следующая серия. 
 
 ```bash
 # 0) сводка: кто готов (возраст, карантин, дайджест, ссылки вне pipeline/)
-python tools/dev/duo_pipeline/duo_pipeline.py archive --list
+duo archive --list
 # 1) дайджест: заготовка с механической подстановкой (даты ветки, L1 task.md, размер);
 #    поля-суждения (<заполнить>) заполняет ЧЕЛОВЕК, запись вставляется в pipeline/ARCHIVE-INDEX.md
-python tools/dev/duo_pipeline/duo_pipeline.py archive --task X --print-digest-template
+duo archive --task X --print-digest-template
 # 2) репетиция: печатает всё, что сделал бы, не меняя ни байта
-python tools/dev/duo_pipeline/duo_pipeline.py archive --task X --dry-run [--archive-root ~/pipeline_archive/<дата>]
+duo archive --task X --dry-run [--archive-root ~/pipeline_archive/<дата>]
 # 3) исполнение: допуск → снимок → верификация → удаление → ARCHIVED.txt
-python tools/dev/duo_pipeline/duo_pipeline.py archive --task X --yes [--force-young] [--min-age-days 14]  # 0 = отключить карантин
-# 4) правка указателей в doc/99-TODO.md на pipeline/ARCHIVE-INDEX.md#X (исключение охранного теста)
+duo archive --task X --yes [--force-young] [--min-age-days 14]  # 0 = отключить карантин
+# 4) правка указателей-на-серию в файлах проекта (в vca — doc/99-TODO.md) на pipeline/ARCHIVE-INDEX.md#X
 # 5) КОММИТ ЧЕЛОВЕКА (staged-удаления серии), напр. `chore(pipeline): archive X` → гейты
 ```
 
 Что делает `archive --task X`: проверяет допуск (серия слита; возраст ≥ 14 дн, иначе
 `--force-young`; нет живого worktree/занятого `.lock`; артефакты закоммичены; дайджест
 `### X` в `pipeline/ARCHIVE-INDEX.md` **без** `<заполнить>`; нет ссылок `pipeline/X`
-вне `pipeline/` кроме `doc/99-TODO.md`/`a3_registry.json`) → снимок всего каталога
+вне `pipeline/` кроме файлов из `archive.guard_exempt_files` + каталогов
+`archive.guard_skip_dirs` проектного конфига) → снимок всего каталога
 (`tar.zst`, без `transcripts/`, `logs/`, `state.json`, `orchestrator*.log`, `.lock`,
 `*.pid`, `untracked_impl_v*.txt`; симлинки не включаются) в
 `~/pipeline_archive/<ГГГГММДД>/series/X.tar.zst` + строка в `MANIFEST.tsv` (дозапись)
