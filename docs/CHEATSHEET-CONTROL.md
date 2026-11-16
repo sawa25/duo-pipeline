@@ -3,8 +3,9 @@
 Оркестратор: `/home/sawa/GitHub/duo-pipeline/duo_pipeline.py` (конфиг —
 `config.json` инструмента + `.duo/config.json` подключённого проекта).
 Артефакты каждой серии: `pipeline/<task>/` В САМОМ ПРОЕКТЕ. Ниже `duo` —
-вызов оркестратора (alias/symlink; развёрнуто —
-`python /home/sawa/GitHub/duo-pipeline/duo_pipeline.py <команда>`).
+вызов оркестратора: лаунчер `bin/duo` (ставится `bash /home/sawa/GitHub/duo-pipeline/install.sh`
+в `~/.local/bin/duo`); развёрнуто —
+`python /home/sawa/GitHub/duo-pipeline/duo_pipeline.py <команда>`.
 Полный формат — `CLAUDE.md` репозитория инструмента; подключение проектов и
 ключи `.duo/config.json` — `docs/PROJECT-SETUP.md`; здесь — рабочие команды
 без воды.
@@ -20,13 +21,50 @@
   списки замещаются целиком; пути терпят `~`/`$VAR`.
 - **Гейты (R3)**: шаги `gates.steps` проектного конфига (`{py}/{pybin}/{cpus}`);
   `duo gates --task X` гоняет их в чистой копии. Пример набора — vca в
-  `docs/PROJECT-SETUP.md`.
+  `docs/PROJECT-SETUP.md`. Как гейты соотносятся с CI проекта и CI самого инструмента —
+  раздел «CI и гейты» ниже.
 - **Надзор (R8)**: `duo supervise` без явного корня обходит РЕЕСТР проектов
   (`duo projects` — таблица/`--add/--remove/--prune`); уведомления помечены
   `duo <проект>/<task>`. С явным `--repo`/`DUO_REPO` — один проект.
 - **Worktree-ресурсы (R4/R7)**: `git.worktree_links` — что симлинкается в
   worktree (`.env` — никогда); `executor_worktree_note` — приписка «не
   перезапускать X» в промпт исполнителя.
+
+## CI и гейты: три контура и кто их потребитель
+
+После переноса оркестратора в отдельный репозиторий (этап 2 duoportable) проверок три. Они не
+заменяют друг друга: красный в одном контуре ничего не говорит о другом.
+
+| контур | что проверяет | где определён | кто потребитель (кому красный) | когда запускается |
+|---|---|---|---|---|
+| **1. CI проекта** (vca: GitHub Actions `.github/workflows/ci.yml`) | код ПРОЕКТА: lint, unit, integration, фронт и т. д. Код оркестратора НЕ проверяет | в проекте: `.github/workflows`, `Makefile` | разработчики проекта; по красному владелец решает, сливать ли | push рабочей ветки и PR; ветки `duo/**` в origin не пушатся |
+| **2. Гейты серии** (`duo gates --task X`) | локальная копия контура 1: те же команды в чистой копии `git archive` + `gate_stubs/` инструмента (роняют тяжёлые модули при импорте, как раннер CI) | проектный `.duo/config.json` → `gates.steps` | тот, кто принимает серию (эксперт/человек): ACCEPT ревьюера ≠ гейты воспроизведены | после принятой имплементации, ДО `commit-by-plan`/`merge` (`merge --dry-run` напомнит) |
+| **3. CI инструмента** (`make check` в duo-pipeline: ruff + pytest `tests`) | сам оркестратор, установщик, лаунчер | репозиторий инструмента: `Makefile`, `.duo/config.json` (тот же прогон = `duo gates --task X` в этом репо) | КАЖДЫЙ проект, подключённый к инструменту: красный здесь = риск для всех | перед каждым коммитом в duo-pipeline; GitHub-remote нет, другого гейта у инструмента нет |
+
+Правила:
+
+1. **Тесты оркестратора принадлежат контуру 3.** Проект их больше не содержит, его CI их не
+   исполняет (vca до этапа 2 гонял 14 `tests/unit/test_duo_*.py` в своём `make unit`).
+   Серия проекта оркестратор не меняет (он вне её дерева); меняется оркестратор серией
+   ВНУТРИ репозитория инструмента: `duo --repo /home/sawa/GitHub/duo-pipeline run --task X`
+   (dogfooding), гейты — `make check`.
+2. **Контур 2 обязан зеркалить контур 1.** Правите `Makefile`/workflow проекта — в том же
+   коммите правите `gates.steps`. Расхождения допустимы осознанно: гейты могут быть строже CI
+   (vca: шаг `li` = `lint-imports`, в CI не запускается) и уже CI (Python-only: фронтенд,
+   Go-клиент, `openapi-drift`, GPU-workflow гейты серии не покрывают — для серий в этих областях
+   соответствующие проверки CI прогоняются вручную). Таблица соответствия для vca — в
+   `pipeline/CHEATSHEET-CONTROL.md` самого vca.
+3. **Единственный контракт между проектом и инструментом, закреплённый тестами с двух сторон, —
+   охрана архива** (`duo archive` повторяет сканирование охранного теста проекта
+   `tests/arch/test_archived_series_refs.py`; проектные значения — `archive.guard_*` в
+   `.duo/config.json`). Литералы пинятся в `tests/unit/test_duo_archive.py` инструмента и в
+   `tests/arch/test_archive_guard_config_sync.py` проекта: красный с любой стороны = вторая
+   сторона разошлась, правятся оба репозитория.
+4. **Надзор (`supervise`, systemd-таймер) — не CI**: он следит за ЖИВЫМИ сериями всех проектов
+   реестра (dead/halted → алерт и авто-возобновление), код и тесты не проверяет.
+5. **Кого запускать:** правка кода проекта → CI проекта и `duo gates`; правка оркестратора →
+   `make check` в duo-pipeline; правка `gates.steps`/`archive.*` проекта → `duo gates --dry-run`
+   (план команд) и тест охраны проекта.
 
 ## Три режима серии
 
@@ -312,7 +350,7 @@ detached. Отказы: живой процесс (`.lock`), `phase=done` без
 **Работает как описано**
 - Claim-gate: `claims` показывает зону держателя; серия `done` держит зону **до `merge`** (отпускается строкой
   `MERGE … зона записи отпущена`), так что слитый/брошенный результат не оставлять висеть.
-- `merge` на «грязном» основном дереве (чужой незакоммиченный WIP в `tools/dev/duo_pipeline/*`, `pipeline/CHEATSHEET-CONTROL.md`)
+- `merge` на «грязном» основном дереве (чужой незакоммиченный WIP владельца в файлах, которых серия не касается)
   проходит, если файлы не пересекаются с диффом серии. `merge --dry-run` предсказал чистое слияние.
 - `commit-by-plan --task X --yes` в worktree: симлинки `models`, `node_modules`, `pipeline/<task>` не коммитятся.
 - Параллельные CPU-тяжёлые измерения соседней серии (`grpspeed`, `taskset -c 16-27`, nice 10) работе pair-серии не мешали.
@@ -329,7 +367,7 @@ detached. Отказы: живой процесс (`.lock`), `phase=done` без
    в worktree бегут с dev-флагами (`SEG=on`, `L2`, `V4`, `TD_LINE_CROP`…): «база до правки» красная (25 падений) и не равна CI.
    **Правило:** гейты поставки — только в чистой копии (`git archive HEAD` + файлы серии, без `.env`; CLAUDE.md п. 6); исполнитель в
    отчёте даёт и ambient-, и чистую цифру (как в `segreuse` §4). С 29.10.2026 `tests/unit/conftest.py` пинит дефолты W1c/L2/V4/SIM_CACHE/TD_LINE_CROP.
-3. **[ЗАКРЫТО КОМАНДОЙ 30.10.2026, `pipegates`: `duo_pipeline.py gates --task X [--ref REF] [--only …] [--extra …] [--dry-run] [--keep]` — ruff/mypy/lint-imports/`tests/unit tests/arch`/integration в чистой копии (`git archive` + заглушки `tools/dev/duo_pipeline/gate_stubs/`); логи и итоговые строки pytest — `pipeline/<task>/logs/gates_<UTC>/summary.txt`; `merge --dry-run` напоминает запустить]** Ревьюер pair-кода не перегоняет тесты (правило фазы): все числа в `rev*_impl.md` — со слов исполнителя, проверены только
+3. **[ЗАКРЫТО КОМАНДОЙ 30.10.2026, `pipegates`: `duo gates --task X [--ref REF] [--only …] [--extra …] [--dry-run] [--keep]` — ruff/mypy/lint-imports/`tests/unit tests/arch`/integration в чистой копии (`git archive` + заглушки `gate_stubs/` инструмента); логи и итоговые строки pytest — `pipeline/<task>/logs/gates_<UTC>/summary.txt`; `merge --dry-run` напоминает запустить]** Ревьюер pair-кода не перегоняет тесты (правило фазы): все числа в `rev*_impl.md` — со слов исполнителя, проверены только
    на внутреннюю непротиворечивость (он честно пишет это в «Where I May Be Wrong»). **ACCEPT ≠ гейты воспроизведены:** эксперт сам
    гонит ruff/mypy/lint-imports/`tests/unit tests/arch`/integration в чистой копии с заглушками до `merge`.
 4. **[ИСПРАВЛЕНО 30.10.2026, `pipefix`: теперь подсказка «повтори с `--yes`», rc=1]** `merge` без `--yes` в неинтерактивном вызове печатал «отменено» (нет tty) — нужен `--yes`.

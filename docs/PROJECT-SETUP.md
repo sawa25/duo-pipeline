@@ -100,11 +100,20 @@ duo setup                # в каталоге проекта
 Пустой `gates.steps` → rc=2 с подсказкой (проект без гейтов — нормальная
 ситуация). Полный набор аргументов — `duo gates --help`.
 
-### Пример: vca-platform (конфиг, эквивалентный прежнему hardcode)
+**Гейты — локальное зеркало CI проекта**, а не отдельная система: `gates.steps` должны
+повторять команды CI проекта (в vca — таргеты `make lint` / `make unit` / `make integration`),
+и правятся они в том же коммите, что и CI. Кто потребитель каждого из трёх контуров (CI
+проекта, гейты серии, CI самого инструмента) и что покрывает каждый — раздел «CI и гейты»
+в `docs/CHEATSHEET-CONTROL.md`.
 
-Перенос с vca-platform выглядел как `.duo/config.json` (в корне vca-platform)
-с такими проектными ключами — поведение байт-в-байт прежнему (пиннинг-тесты
-`tests/unit/test_duo_gates.py`, `test_duo_portable.py`):
+### Пример: vca-platform (реальный проектный слой после этапа 2, 2026-11-16)
+
+Так выглядит `/home/sawa/GitHub/vca-platform/.duo/config.json` (там же длинный
+`executor_env_hint`). Эквивалентность прежнему hardcode проверена сверкой старой встроенной
+копии оркестратора и нового инструмента на реальном vca: шаги гейтов (argv/pp/timeout),
+наборы охраны архива, ветки слияния, симлинки worktree, текст worktree-блока промпта и
+`executor_env_hint` совпали байт-в-байт. Пиннинг — `tests/unit/test_duo_gates.py`,
+`test_duo_portable.py`:
 
 ```json
 {
@@ -112,7 +121,6 @@ duo setup                # в каталоге проекта
   "executor_worktree_note": "API-сервер :8001 не перезапускай.",
   "gates": {
     "python": "~/anaconda3/envs/env311/bin/python",
-    "stubs": null,
     "cpus": "0-11",
     "steps": [
       {"name": "ruff",  "pp": false, "timeout": 900,
@@ -131,8 +139,7 @@ duo setup                # в каталоге проекта
        "summary": "last_line"}
     ]
   },
-  "git": {"isolation": "shared", "worktrees_dir": ".worktrees",
-          "worktree_links": ["data", "models", "node_modules"]},
+  "git": {"worktree_links": ["data", "models", "node_modules"]},
   "archive": {
     "guard_skip_dirs": ["data", "models", "vca_platform.egg-info"],
     "guard_exempt_files": ["doc/99-TODO.md",
@@ -145,11 +152,13 @@ duo setup                # в каталоге проекта
 (`tests/arch` в примере — путь vca; в других проектах свои. Списки шагов
 замещают целиком — проектный набор не смешивается с чужим. `archive.*` —
 прежние значения охраны vca: тяжёлые каталоги не сканируются, указатели
-99-TODO/a3_registry не блокируют удаление серии. `guard.never_revert` в примере
+99-TODO/a3_registry не блокируют удаление серии; те же значения держит охранный
+тест vca, а их совпадение с конфигом проверяет
+`tests/arch/test_archive_guard_config_sync.py` в vca. `guard.never_revert` в примере
 не задан: прежнее значение vca (`tools/dev/duo_pipeline/`) защищало каталог
 оркестратора ВНУТРИ дерева vca — после переноса кода в отдельный репозиторий
 его там больше нет; при живом аналоге (напр. генерируемые данные хозяина)
-добавь список путей.)
+добавь список путей. Шаг `li` (lint-imports) строже CI vca: в `ci.yml` его нет.)
 
 ## Мультипроектный надзор (R8)
 
@@ -165,6 +174,14 @@ Systemd-таймер ставится командой `bash /home/sawa/GitHub/d
 `duo-supervise.*` (например, старый таймер vca-platform): проекты, за которыми он следил,
 должны быть в реестре (`duo setup` или `duo projects --add PATH`) — иначе после замены их
 серии останутся без надзора.
+
+**Переход со старого таймера vca (сделан 2026-11-16).** Прежние юниты сохранены рядом как
+`~/.config/systemd/user/duo-supervise.{service,timer}.bak-<время>` (откат: вернуть файлы,
+`systemctl --user daemon-reload`). Состояние надзора лежит в том же
+`~/.local/state/duo-supervisor/state.json`, но под новыми ключами `<корень>::<task>`; старые
+записи (ключ — голое имя задачи) не мигрировались и остаются безвредным хвостом. Первый тик
+по новым ключам молча «запоминает» события старше часа: повторных уведомлений о старых
+`done`/`impl_pending` нет (до переключения это проверено `duo supervise --dry-run`).
 
 ## Границы
 
