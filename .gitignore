@@ -9,3 +9,10 @@ pipeline/*/.lock
 
 # git-worktree параллельных серий (git.worktrees_dir из config.json)
 /.worktrees/
+
+# артефакты серий (pipeline/<task>/) не публикуются: это данные серий
+# (транскрипты, логи, патчи), а не код инструмента; в коммиты — только инструмент
+/pipeline/
+
+# секреты (токены для пуша и т.п.)
+githubtoken.md
