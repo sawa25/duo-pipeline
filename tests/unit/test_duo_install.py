@@ -86,7 +86,8 @@ def test_launcher_reads_machine_env_file_and_local_bin(tmp_path: Path):
     скрипт-зонд, печатающий то, что увидел дочерний процесс."""
     (tmp_path / ".local/bin").mkdir(parents=True)
     probe = tmp_path / "probe"
-    probe.write_text('#!/bin/sh\necho "CPUS=$DUO_GATES_CPUS"\necho "PATH=$PATH"\n', encoding="utf-8")
+    probe.write_text('#!/bin/sh\necho "CPUS=$DUO_GATES_CPUS"\necho "PATH=$PATH"\necho "PY=$DUO_PYTHON"\n',
+                     encoding="utf-8")
     probe.chmod(0o755)
     env_file = tmp_path / ".config" / "duo-pipeline" / "env"
     env_file.parent.mkdir(parents=True)
@@ -94,6 +95,7 @@ def test_launcher_reads_machine_env_file_and_local_bin(tmp_path: Path):
     p = _run([str(LAUNCHER)], tmp_path, PATH="/usr/bin:/bin")
     assert p.returncode == 0, p.stderr
     assert "CPUS=0-3" in p.stdout
+    assert f"PY={probe}" in p.stdout                            # выбранный интерпретатор экспортирован
     assert f"PATH={tmp_path}/.local/bin:/usr/bin:/bin" in p.stdout
 
 

@@ -48,4 +48,8 @@ pick_python() {
     exit 127
 }
 
-exec "$(pick_python)" "$ROOT/duo_pipeline.py" "$@"
+# Выбранный интерпретатор экспортируется: его видят исполнитель и ревьюеры (дочерний claude)
+# и шаги гейтов — подсказки в проектном конфиге могут ссылаться на $DUO_PYTHON, а не на путь машины.
+DUO_PYTHON="$(pick_python)"
+export DUO_PYTHON
+exec "$DUO_PYTHON" "$ROOT/duo_pipeline.py" "$@"
