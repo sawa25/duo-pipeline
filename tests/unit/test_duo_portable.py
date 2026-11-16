@@ -165,12 +165,12 @@ def test_load_config_expands_paths(tmp_path: Path, monkeypatch):
     layer.write_text(json.dumps({
         "claude_config_dir": "~/.claude-glm",
         "council_agents_dir": "$DUO_TEST_DIR/agents",
-        "gates": {"python": "~/env311/bin/python", "stubs": "$DUO_TEST_DIR/gate_stubs"},
+        "gates": {"python": "~/venv/bin/python", "stubs": "$DUO_TEST_DIR/gate_stubs"},
     }), encoding="utf-8")
     cfg = duo.load_config(layer)
     assert cfg["claude_config_dir"] == str(home / ".claude-glm")
     assert cfg["council_agents_dir"] == str(tmp_path / "shared" / "agents")
-    assert cfg["gates"]["python"] == str(home / "env311" / "bin" / "python")
+    assert cfg["gates"]["python"] == str(home / "venv" / "bin" / "python")
     assert cfg["gates"]["stubs"] == str(tmp_path / "shared" / "gate_stubs")
 
 
@@ -240,13 +240,13 @@ def test_pipeline_wires_never_revert_into_guards(tmp_path: Path):
 
 
 # ---------------------------------------------------------------------------
-# R7: executor_worktree_note (без пиннингов vca в коде)
+# R7: executor_worktree_note (проектная приписка живёт в конфиге, не в коде)
 # ---------------------------------------------------------------------------
 
-OLD_VCA_WT_BLOCK = (
+WT_BLOCK_WITH_NOTE = (
     "Изоляция: ты работаешь в отдельном git-worktree `/tmp/x` (ветка `duo/demo`); параллельно "
     "могут идти другие серии в своих worktree. Правь файлы только в этом дереве: основное дерево и "
-    "чужие worktree не трогай, API-сервер :8001 не перезапускай.\n"
+    "чужие worktree не трогай, Сервис :8080 не перезапускай.\n"
 )
 
 
@@ -255,18 +255,19 @@ def test_executor_worktree_note_byte_exact():
     assert _fake_executor(dict(base), {"isolation": "shared"})._wt_block() == ""   # shared — пусто
     assert _fake_executor(dict(base), {"isolation": "worktree", "task": "demo"})._wt_block().endswith(
         "чужие worktree не трогай.\n")                                             # без заметки — прежний хвост
-    p = _fake_executor({**base, "executor_worktree_note": "API-сервер :8001 не перезапускай."},
+    p = _fake_executor({**base, "executor_worktree_note": "Сервис :8080 не перезапускай."},
                        {"isolation": "worktree", "task": "demo"})
-    assert p._wt_block() == OLD_VCA_WT_BLOCK   # vca-значение ключа = прежний блок байт-в-байт
+    assert p._wt_block() == WT_BLOCK_WITH_NOTE   # приписка из конфига дописывается к блоку байт-в-байт
     q = _fake_executor({**base, "executor_worktree_note": "  Свои услуги лежат в systemd.  "},
                        {"isolation": "worktree", "task": "demo"})
     assert q._wt_block().endswith("чужие worktree не трогай, Свои услуги лежат в systemd.\n")
 
 
-def test_no_vca_pins_in_sources():
-    # пины старого окружения vca (:8001, пути дерева vca, LINK_TARGETS) и старые пути
-    # запуска в ПОДСКАЗКАХ (фактический re-exec в run_detached идёт по Path(__file__) — код)
-    pins = (":8001", "vca-platform", "LINK_TARGETS",
+def test_no_project_pins_in_sources():
+    # пины окружения конкретного проекта (порт сервиса, LINK_TARGETS) и старые пути запуска в
+    # ПОДСКАЗКАХ (фактический re-exec в run_detached идёт по Path(__file__) — код); имена
+    # проектов/хостов и домашние пути ловит test_duo_public_hygiene
+    pins = (":8001", "LINK_TARGETS",
             "tools/dev/duo_pipeline", "python duo_pipeline.py", "python {Path(__file__).name}")
     for src in (DUO_PIPELINE_PATH, DUO_PIPELINE_PATH.parent / "provision_worktree.py",
                 DUO_PIPELINE_PATH.parent / "archive_cmd.py"):

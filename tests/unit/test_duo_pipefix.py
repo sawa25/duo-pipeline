@@ -126,15 +126,15 @@ def test_merge_removes_worktree_after_sync_brought_artifacts(tmp_path: Path, cap
 # ---------------------------------------------------------------------------
 
 
-TDLCGUARD_ZONE = ["text_detection/optimized_text_detector.py", "tests/unit/test_td_line_crop.py"]
+NUMBERED_HEADING_ZONE = ["pkg/detector.py", "tests/unit/test_detector.py"]
 
 
 def test_parse_files_touch_numbered_heading_variants():
-    """Дословный вид из pipeline/tdlcguard/plan_v1.md:105 (`## 12. files_touch`)."""
+    """Вид из боевого плана: заголовок с номером (`## 12. files_touch`)."""
     plan = ("# план\n\n## 12. files_touch\n\n"
-            "- `text_detection/optimized_text_detector.py`\n"
-            "- `tests/unit/test_td_line_crop.py`\n\n## Риски\n")
-    assert duo.parse_files_touch(plan) == TDLCGUARD_ZONE
+            "- `pkg/detector.py`\n"
+            "- `tests/unit/test_detector.py`\n\n## Риски\n")
+    assert duo.parse_files_touch(plan) == NUMBERED_HEADING_ZONE
     for heading in ("## 5) files_touch", "## 12.files_touch", "## FILES_TOUCH",
                     "## Files_Touch (зона записи)", "### files_touch"):
         assert duo.parse_files_touch(f"# план\n\n{heading}\n\n- `a/b.py`\n") == ["a/b.py"], heading

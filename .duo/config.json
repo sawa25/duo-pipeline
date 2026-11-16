@@ -1,8 +1,7 @@
 {
-  "_comment": "переопределения duo-пайплайна для ЭТОГО репозитория (duo-pipeline, dogfooding). Слои: DEFAULTS < config.json инструмента < этот файл. Справочник ключей — docs/PROJECT-SETUP.md.",
-  "executor_env_hint": "Интерпретатор: ~/anaconda3/envs/env311/bin/python (stdlib-only проект). Гейты: make check (ruff + pytest, без своего -q).",
+  "_comment": "переопределения duo-пайплайна для ЭТОГО репозитория (dogfooding). Слои: DEFAULTS < config.json инструмента < этот файл. Справочник ключей — docs/PROJECT-SETUP.md. gates.python не задан намеренно: интерпретатор гейтов = тот, что запустил оркестратор (на каждой машине его выбирает лаунчер bin/duo или DUO_PYTHON); путь интерпретатора непереносим между стендами.",
+  "executor_env_hint": "Проект stdlib-only (Python >= 3.11). Интерпретатор — тот, что запустил оркестратор; гейты: make check (ruff + pytest tests, без своего -q: он уже в pyproject).",
   "gates": {
-    "python": "~/anaconda3/envs/env311/bin/python",
     "steps": [
       {
         "name": "ruff",

@@ -1,16 +1,15 @@
 """pipegates: подкоманда `gates` — гейты поставки в чистой копии (git archive REF +
-заглушки gate_stubs, падающие при импорте), DEPRECATED-пометка hold/release,
+проектные заглушки gates.stubs, падающие при импорте), DEPRECATED-пометка hold/release,
 подсказка гейтов в `merge --dry-run`, обратная совместимость конфига/соседних серий.
 
 R3 (duoportable): набор шагов и их argv — из gates.steps КОНФИГА (плейсхолдеры
-{py}/{pybin}/{cpus}); песочница _gcfg несёт пять vca-шагов ДОСЛОВНО из старого
-hardcode (байт-в-байт инвариант — test_gates_steps_from_config_byte_exact).
+{py}/{pybin}/{cpus}); песочница _gcfg несёт пять типовых шагов (ruff/mypy/import-linter/
+два pytest) в формате конфига (байт-в-байт инвариант — test_gates_steps_from_config_byte_exact).
 
 Паттерн test_duo_pipev3/pipemodes: модуль оркестратора — importlib-ом, git-песочницы —
 в tmp_path, тяжёлые команды гейтов НЕ исполняются: раннер внедряется параметром
 `runner=` в cmd_gates (DI, как spawn/notify в supervise_tick) и возвращает canned
 (rc, out); его замыкание снимает argv/env/cwd и листинг копии, пока та жива.
-Реальные subprocess здесь — только 5 быстрых `import <pkg>` под стабами (тест в).
 """
 
 from __future__ import annotations
@@ -31,7 +30,6 @@ from tests.unit.test_duo_pipev3 import _cfg, _git, _init_repo, _mk_task, duo
 from tests.unit.test_duo_pipework2 import _set_state
 
 REPO_ROOT = Path(__file__).resolve().parent.parent.parent
-STUBS = REPO_ROOT / "gate_stubs"
 STUB_PKGS = ("llama_cpp", "onnx", "onnxruntime", "pynvml", "torch")
 PY = Path(os.path.abspath(sys.executable))   # {py} по умолчанию = sys.executable, БЕЗ раскрытия симлинков
 PYBIN = PY.parent
@@ -42,9 +40,9 @@ def _gates_ns(task="demo", ref=None, name=None, only=None, extra=None, dry_run=F
                               dry_run=dry_run, keep=keep)
 
 
-def _vca_steps():
-    """Пять шагов vca — ДОСЛОВНО бывший hardcode gates_steps (бутстрап 5305210);
-    R3 переехал из кода в конфиг, регрессию держит test_gates_steps_from_config_byte_exact."""
+def _sample_steps():
+    """Пять типовых шагов гейтов (линтеры + два pytest-прогона); формат — как в gates.steps
+    конфига проекта; регрессию держит test_gates_steps_from_config_byte_exact."""
     return json.loads(json.dumps([
         {"name": "ruff", "argv": ["{pybin}/ruff", "check", "."], "pp": False, "timeout": 900},
         {"name": "mypy", "argv": ["{pybin}/mypy"], "pp": False, "timeout": 900},
@@ -59,10 +57,21 @@ def _vca_steps():
     ]))
 
 
+def _stubs(tmp_path: Path) -> Path:
+    """Каталог пакетов-заглушек песочницы. Инструмент своих заглушек не поставляет: набор —
+    дело проекта (gates.stubs), здесь это типичные «тяжёлые» зависимости."""
+    d = tmp_path / "gate_stubs"
+    for pkg in STUB_PKGS:
+        (d / pkg).mkdir(parents=True, exist_ok=True)
+        (d / pkg / "__init__.py").write_text(
+            f"raise ImportError('stub: {pkg} is not installed in CI')\n", encoding="utf-8")
+    return d
+
+
 def _gcfg(tmp_path: Path, repo: Path, **over) -> dict:
-    """cfg песочницы гейтов с vca-набором шагов в конфиге (R3)."""
+    """cfg песочницы гейтов: типовой набор шагов и каталог заглушек в конфиге (R3)."""
     cfg = _cfg(tmp_path, repo)
-    cfg["gates"] = {"cpus": "0-11", "steps": _vca_steps()}
+    cfg["gates"] = {"cpus": "0-11", "stubs": str(_stubs(tmp_path)), "steps": _sample_steps()}
     cfg.update(over)
     return cfg
 
@@ -123,9 +132,8 @@ def _last_log_dir(repo: Path, task="demo") -> Path:
 
 
 def test_gates_steps_from_config_byte_exact():
-    """R3-регрессия: конфиг с пятью шагами vca разрешается БАЙТ-В-БАЙТ как
-    захардкоженные в бутстрапе (5305210) gates_steps: argv/pp/timeout/summary.
-    {py} по умолчанию = sys.executable (gates.python не задан)."""
+    """R3-регрессия: конфиг с пятью типовыми шагами разрешается БАЙТ-В-БАЙТ в ожидаемые
+    argv/pp/timeout/summary. {py} по умолчанию = sys.executable (gates.python не задан)."""
     pinned = [
         {"name": "ruff", "pp": False, "timeout": 900, "summary": "last_line",
          "argv": [f"{PYBIN}/ruff", "check", "."]},
@@ -142,7 +150,7 @@ def test_gates_steps_from_config_byte_exact():
                   "nice", "-n", "10", str(PY), "-m", "pytest",
                   "-m", "integration and not gpu"]},
     ]
-    assert duo.gates_steps({"gates": {"cpus": "0-11", "steps": _vca_steps()}}) == pinned
+    assert duo.gates_steps({"gates": {"cpus": "0-11", "steps": _sample_steps()}}) == pinned
 
 
 def test_gates_python_symlink_not_resolved(tmp_path: Path):
@@ -175,21 +183,86 @@ def test_gates_only_unknown_names_from_config(tmp_path: Path):
         duo.cmd_gates(cfg, _gates_ns(only="ruff"), runner=_fake_runner({}, []))
 
 
-def test_gates_stubs_disabled_and_custom(tmp_path: Path, capsys):
-    """R3: gates.stubs='' — заглушки не подмешиваются (PYTHONPATH=копия); путь —
-    используется и печатается в заголовке."""
+def test_gates_stubs_default_off_relative_and_custom(tmp_path: Path, capsys):
+    """gates.stubs: ключ не задан или '' — заглушки не подмешиваются (PYTHONPATH=копия);
+    относительный путь — от корня проекта; абсолютный — как есть; путь печатается в заголовке."""
+    repo = _gate_repo(tmp_path)
+    for variant in ("absent", ""):
+        cfg = _gcfg(tmp_path, repo)
+        if variant == "absent":
+            cfg["gates"].pop("stubs")
+        else:
+            cfg["gates"]["stubs"] = variant
+        calls: list = []
+        assert duo.cmd_gates(cfg, _gates_ns(), runner=_fake_runner({}, calls)) == 0
+        assert calls[3]["env"]["PYTHONPATH"] == str(calls[3]["cwd"])   # unit: только копия
+    capsys.readouterr()                                           # сброс: дальше только dry-run'ы
+    rel = repo / ".duo" / "stubs"
+    rel.mkdir(parents=True)
+    cfg_rel = _gcfg(tmp_path, repo)
+    cfg_rel["gates"]["stubs"] = ".duo/stubs"
+    assert duo.cmd_gates(cfg_rel, _gates_ns(dry_run=True)) == 0
+    assert f"stubs={repo.resolve() / '.duo' / 'stubs'}" in capsys.readouterr().out.splitlines()[0]
+    custom = _subdir(tmp_path, "mystubs")
+    cfg_abs = _gcfg(tmp_path, repo)
+    cfg_abs["gates"]["stubs"] = str(custom)
+    assert duo.cmd_gates(cfg_abs, _gates_ns(dry_run=True)) == 0
+    assert f"stubs={custom}" in capsys.readouterr().out.splitlines()[0]
+
+
+def test_gates_stubs_missing_dir_refuses(tmp_path: Path):
     repo = _gate_repo(tmp_path)
     cfg = _gcfg(tmp_path, repo)
-    cfg["gates"]["stubs"] = ""
+    cfg["gates"]["stubs"] = ".duo/нет_такого"
+    with pytest.raises(SystemExit, match="нет каталога заглушек"):
+        duo.cmd_gates(cfg, _gates_ns(), runner=_fake_runner({}, []))
+
+
+def test_gates_explicit_python_missing_refuses_with_hint(tmp_path: Path):
+    """Явный gates.python, которого нет на этой машине (путь другого стенда), — внятный отказ
+    ДО запуска шагов, с подсказкой убрать ключ; без ключа проверка не срабатывает."""
+    repo = _gate_repo(tmp_path)
+    cfg = _gcfg(tmp_path, repo)
+    cfg["gates"]["python"] = str(tmp_path / "другой_стенд" / "bin" / "python")
     calls: list = []
+    with pytest.raises(SystemExit, match=r"gates\.python=.*не найден.*Уберите ключ"):
+        duo.cmd_gates(cfg, _gates_ns(), runner=_fake_runner({}, calls))
+    assert not calls                                            # ни одного шага не запущено
+    cfg["gates"].pop("python")
     assert duo.cmd_gates(cfg, _gates_ns(), runner=_fake_runner({}, calls)) == 0
-    assert calls[3]["env"]["PYTHONPATH"] == str(calls[3]["cwd"])   # unit: только копия
-    custom = _subdir(tmp_path, "mystubs")
-    capsys.readouterr()                                           # сброс: дальше только второй прогон
-    cfg2 = _gcfg(tmp_path, repo)
-    cfg2["gates"]["stubs"] = str(custom)
-    assert duo.cmd_gates(cfg2, _gates_ns(dry_run=True)) == 0
-    assert f"stubs={custom}" in capsys.readouterr().out.splitlines()[0]
+
+
+def test_gates_cpus_env_override_between_config_and_default(monkeypatch):
+    """Приоритет: gates.cpus проекта > $DUO_GATES_CPUS (машинная настройка) > все ядра."""
+    cfg = {"gates": {"steps": [{"name": "u", "argv": ["{cpus}"]}]}}
+    monkeypatch.setenv("DUO_GATES_CPUS", "2-3")
+    assert duo._gates_resolve(cfg)["cpus"] == "2-3"
+    cfg["gates"]["cpus"] = "0-1"
+    assert duo._gates_resolve(cfg)["cpus"] == "0-1"
+    monkeypatch.delenv("DUO_GATES_CPUS")
+    del cfg["gates"]["cpus"]
+    assert duo._gates_resolve(cfg)["cpus"] == duo._default_cpus()
+
+
+def test_default_cpus_format_and_fallback(monkeypatch):
+    monkeypatch.setattr(os, "sched_getaffinity", lambda _pid: {0, 1, 2, 3, 8, 9, 11}, raising=False)
+    assert duo._default_cpus() == "0-3,8-9,11"
+    monkeypatch.setattr(os, "sched_getaffinity", lambda _pid: {5}, raising=False)
+    assert duo._default_cpus() == "5"
+
+    def boom(_pid):
+        raise OSError("нет affinity")
+    monkeypatch.setattr(os, "sched_getaffinity", boom, raising=False)
+    monkeypatch.setattr(os, "cpu_count", lambda: 4)
+    assert duo._default_cpus() == "0-3"
+
+
+def test_gates_cpus_default_is_all_available_and_valid():
+    """gates.cpus не задан → все ядра процесса (не зашитое 0-11: на машине поменьше оно невалидно)."""
+    g = duo._gates_resolve({"gates": {"steps": [{"name": "u", "argv": ["taskset", "-c", "{cpus}", "true"]}]}})
+    assert g["cpus"] == duo._default_cpus() and g["steps"][0]["argv"][2] == g["cpus"]
+    if shutil.which("taskset"):
+        assert subprocess.run(["taskset", "-c", g["cpus"], "true"], timeout=30).returncode == 0
 
 
 # --- (а) dry-run: план шагов и команд ---------------------------------------------
@@ -201,7 +274,7 @@ def test_gates_dry_run_plan_and_commands(tmp_path: Path, capsys):
     out = capsys.readouterr().out
     header = out.splitlines()[0]
     assert "task=demo" in header and "ref=duo/demo" in header and "cpus=0-11" in header
-    assert f"stubs={STUBS}" in header
+    assert f"stubs={_stubs(tmp_path)}" in header
     # последовательность шагов ровно canonическая
     marks = [f"[{i}/5] {n}" for i, n in enumerate(("ruff", "mypy", "li", "unit", "integ"), 1)]
     assert [out.index(m) for m in marks] == sorted(out.index(m) for m in marks)
@@ -215,7 +288,7 @@ def test_gates_dry_run_plan_and_commands(tmp_path: Path, capsys):
     unit_line = [ln for ln in out.splitlines() if "tests/unit tests/arch" in ln][0].split("$ ")[1]
     assert "-q" not in unit_line.split()                       # своего -q НЕТ (addopts уже есть)
     # PYTHONPATH со стабами первым — только pytest-шагам
-    assert out.count(f"env: PYTHONPATH={STUBS}:") == 2
+    assert out.count(f"env: PYTHONPATH={_stubs(tmp_path)}:") == 2
     # dry-run ничего не создаёт и копию убирает
     assert not (repo / "pipeline" / "demo" / "logs").exists()
     assert not Path(re.search(r"copy=(\S+)", header).group(1)).exists()
@@ -270,7 +343,7 @@ def test_gates_copy_from_ref_not_worktree(tmp_path: Path):
     ls = calls[0]["ls"]
     assert "pyproject.toml" in ls and "feature.txt" in ls      # содержимое REF (ветки)
     assert "dirty.txt" not in ls                               # незакоммиченное НЕ попало
-    assert calls[3]["env"]["PYTHONPATH"] == f"{STUBS}:{calls[3]['cwd']}"   # стабы первыми
+    assert calls[3]["env"]["PYTHONPATH"] == f"{_stubs(tmp_path)}:{calls[3]['cwd']}"   # стабы первыми
     # линтерам PYTHONPATH не подменяется (наследуется окружение, как в ручном прогоне)
     assert calls[0]["env"].get("PYTHONPATH") == os.environ.get("PYTHONPATH")
     summary = (_last_log_dir(repo) / "summary.txt").read_text(encoding="utf-8")
@@ -285,22 +358,6 @@ def test_gates_extra_files_copied(tmp_path: Path):
     assert "dirty.txt" in calls[0]["ls"]
     summary = (_last_log_dir(repo) / "summary.txt").read_text(encoding="utf-8")
     assert "files=dirty.txt" in summary.splitlines()[0]
-
-
-# --- (в) стабы падают при импорте --------------------------------------------------
-
-
-def test_gate_stub_imports_fail():
-    assert STUBS.is_dir(), f"нет каталога стабов {STUBS}"
-    for pkg in STUB_PKGS:
-        f = STUBS / pkg / "__init__.py"
-        assert f.read_text(encoding="utf-8").strip() == \
-            f"raise ImportError('stub: {pkg} is not installed in CI')"
-        env = {**os.environ, "PYTHONPATH": str(STUBS)}
-        p = subprocess.run([sys.executable, "-c", f"import {pkg}"], env=env,
-                           capture_output=True, text=True, timeout=60)
-        assert p.returncode != 0, f"стаб {pkg} не упал при импорте"
-        assert f"stub: {pkg} is not installed in CI" in p.stderr
 
 
 # --- (г) красный/зелёный шаг, summary, дословный хвост pytest ----------------------
@@ -397,33 +454,18 @@ def test_compat_config_without_gates_key(tmp_path: Path):
     cfg_file = tmp_path / "config.json"
     cfg_file.write_text(json.dumps({"repo": str(tmp_path), "model": "test"}), encoding="utf-8")
     cfg = duo.load_config(cfg_file)                             # user-конфиг БЕЗ gates
-    assert cfg["gates"]["cpus"] == "0-11"                       # умолчание из DEFAULTS
+    assert cfg["gates"]["cpus"] is None                         # умолчание из DEFAULTS: все ядра
     base = json.loads(json.dumps(duo.DEFAULTS))
     duo.deep_merge(base, {"repo": "/x", "limits": {"budget_usd": 1.0}})
-    assert base["gates"]["cpus"] == "0-11"                      # merge ключ не теряет
+    assert "cpus" in base["gates"]                              # merge ключ не теряет
     hand = _cfg(tmp_path, tmp_path)                             # самодельный cfg без gates
-    assert (hand.get("gates") or {}).get("cpus", "0-11") == "0-11"
+    assert duo._gates_resolve(hand)["cpus"] == duo._default_cpus()
 
 
-def test_compat_neighbor_plans_and_state_parse(tmp_path: Path):
-    """Пины plan_v1.md ближайших серий (сняты ДО правок, plan §8.4): parse_files_touch
-    и zone_conflicts разбираются так же, как до правки; state.json серии — копия."""
-    zone = {}
-    for name, pinned in (("pipefix", ["tools/dev/duo_pipeline/duo_pipeline.py",
-                                      "tests/unit/test_duo_pipefix.py"]),
-                         ("wdlag", ["api_server/worker/runner.py",
-                                    "tests/unit/test_watchdog_loop_lag.py"])):
-        src = REPO_ROOT / "pipeline" / name / "plan_v1.md"
-        if not src.exists():                                    # серии vca-platform — не в этом репо (бутстрап)
-            continue
-        dst = tmp_path / f"{name}_plan_v1.md"
-        shutil.copy(src, dst)                                   # оригинал только читается
-        zone[name] = duo.parse_files_touch(dst.read_text(encoding="utf-8"))
-        assert zone[name] == pinned
-    if len(zone) == 2:
-        assert duo.zone_conflicts(zone["pipefix"], zone["wdlag"]) == []
-    # state.json серии не отслеживается git (им управляет оркестратор) — в чистой копии/CI его нет;
-    # поэтому читаем синтетический слепок того же формата (правка эксперта после гейта в чистой копии)
+def test_compat_state_json_parse(tmp_path: Path):
+    """state.json серии читается как есть."""
+    # state.json не отслеживается git (им управляет оркестратор) — в чистой копии/CI его нет;
+    # поэтому читаем синтетический слепок того же формата
     state_dst = tmp_path / "pipegates_state.json"
     state_dst.write_text(json.dumps({"task": "pipegates", "mode": "pair", "isolation": "worktree"}),
                          encoding="utf-8")

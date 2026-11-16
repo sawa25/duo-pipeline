@@ -3,7 +3,8 @@
 Ни один тест не читает и не пишет живые ~/.config/duo-pipeline/projects.json
 (реестр проектов) и ~/.local/state/duo-supervisor/state.json (состояние надзора):
 XDG-переменные указывают во временный каталог теста. DUO_REPO из окружения
-машины убран — иначе он подменял бы разрешение корня в resolve_repo().
+машины убран — иначе он подменял бы разрешение корня в resolve_repo(). Машинные настройки
+(DUO_GATES_CPUS) тоже убраны — иначе они подменяли бы умолчания гейтов.
 """
 
 from __future__ import annotations
@@ -16,3 +17,4 @@ def _xdg_isolation(tmp_path, monkeypatch):
     monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "xdg-config"))
     monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "xdg-state"))
     monkeypatch.delenv("DUO_REPO", raising=False)
+    monkeypatch.delenv("DUO_GATES_CPUS", raising=False)

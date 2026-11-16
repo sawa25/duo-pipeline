@@ -80,10 +80,27 @@ def test_launcher_bad_duo_python_fails_loudly(tmp_path: Path):
     assert p.returncode != 0
 
 
+def test_launcher_reads_machine_env_file_and_local_bin(tmp_path: Path):
+    """Машинные настройки — из ~/.config/duo-pipeline/env (вне git), а ~/.local/bin добавляется в
+    PATH (там `claude`; в неинтерактивном ssh/systemd его иначе может не быть). «Интерпретатор» —
+    скрипт-зонд, печатающий то, что увидел дочерний процесс."""
+    (tmp_path / ".local/bin").mkdir(parents=True)
+    probe = tmp_path / "probe"
+    probe.write_text('#!/bin/sh\necho "CPUS=$DUO_GATES_CPUS"\necho "PATH=$PATH"\n', encoding="utf-8")
+    probe.chmod(0o755)
+    env_file = tmp_path / ".config" / "duo-pipeline" / "env"
+    env_file.parent.mkdir(parents=True)
+    env_file.write_text(f"DUO_PYTHON={probe}\nDUO_GATES_CPUS=0-3\n", encoding="utf-8")
+    p = _run([str(LAUNCHER)], tmp_path, PATH="/usr/bin:/bin")
+    assert p.returncode == 0, p.stderr
+    assert "CPUS=0-3" in p.stdout
+    assert f"PATH={tmp_path}/.local/bin:/usr/bin:/bin" in p.stdout
+
+
 def test_launcher_is_executable_and_shipped_files_exist():
     assert os.access(LAUNCHER, os.X_OK) and os.access(INSTALL, os.X_OK)
     assert (REPO_ROOT / "skill" / "SKILL.md").read_text(encoding="utf-8").startswith("---\nname: duo-pipeline\n")
     assert (REPO_ROOT / "systemd" / "duo-supervise.service.in").exists()
-    assert not (REPO_ROOT / "systemd" / "install.sh").exists()                 # старая vca-копия убрана
+    assert not (REPO_ROOT / "systemd" / "install.sh").exists()                 # старой копии в systemd/ нет
     assert "@ROOT@/bin/duo supervise" in (REPO_ROOT / "systemd" / "duo-supervise.service.in").read_text(
         encoding="utf-8")

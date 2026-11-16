@@ -4,10 +4,34 @@
 Режимы: **solo** (один исполнитель), **pair** (исполнитель + один проверяющий),
 **duo** (исполнитель + дуэт + председатель).
 
-Единый источник истины: код, конфиг по умолчанию, шпаргалки и скилл лежат здесь;
-проекты в `/home/sawa/GitHub/<проект>/` хранят только `pipeline/<task>/` и
-`.duo/config.json`.
+Единый источник истины: код, конфиг по умолчанию, шпаргалки и скилл лежат здесь; проект
+хранит у себя только `pipeline/<task>/` (артефакты серий) и необязательный `.duo/config.json`.
 
-- Управление: `docs/CHEATSHEET-CONTROL.md`
-- Подключение проекта: `docs/PROJECT-SETUP.md`
-- Гейты разработки инструмента: `make check`
+## Требования
+
+Linux, Python ≥ 3.11 (только stdlib), git, [Claude Code CLI](https://docs.claude.com/en/docs/claude-code)
+(`claude`), профиль модели (по умолчанию `~/.claude-glm` — ключ `claude_config_dir`).
+Для гейтов и `make check` — `ruff` и `pytest` в используемом интерпретаторе.
+
+## Установка на машине
+
+```bash
+git clone https://github.com/sawa25/duo-pipeline.git && cd duo-pipeline
+bash install.sh --personas     # лаунчер ~/.local/bin/duo, скилл, персоны ревьюеров
+bash install.sh --check        # что установлено
+cd /путь/к/проекту && duo setup   # подключить проект (.duo/config.json, реестр проектов)
+```
+
+Лаунчер `bin/duo` сам выбирает интерпретатор: `$DUO_PYTHON` > `env311` в anaconda/miniconda >
+`python3.12`/`3.11`/`python3` (нужен ≥ 3.11) и добавляет `~/.local/bin` в `PATH` (там живёт
+`claude`; в неинтерактивном ssh и systemd его иначе может не быть).
+
+## Документация
+
+- Управление сериями: [docs/CHEATSHEET-CONTROL.md](docs/CHEATSHEET-CONTROL.md)
+- Подключение проекта и несколько машин: [docs/PROJECT-SETUP.md](docs/PROJECT-SETUP.md)
+- Надзор и отказоустойчивость: [docs/CHEATSHEET-WATCHDOG-FAILSAFE.md](docs/CHEATSHEET-WATCHDOG-FAILSAFE.md)
+- Гейты разработки самого инструмента: `make check`
+
+Состояние: инструмент отлажен на личных стендах автора; настройки под чужую среду (модель,
+профиль, окружение гейтов) делаются через `.duo/config.json` проекта.

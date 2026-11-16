@@ -1,11 +1,11 @@
-"""guards (29.10.2026): защита от граблей 6–10 серий amdtdlc/m2group/speedlim и улучшения (7)–(10).
+"""guards (29.10.2026): защита от граблей 6–10 реальных серий и улучшения (7)–(10).
 
 Что фиксируют тесты:
   * (7) guard пустого ревью (pair): ACCEPT при нуле tool_use не засчитывается — повтор с напоминанием,
     затем halt kind=review_empty (rev-файла и «сгоревшего» номера нет), `--resume` повторяет ревью;
     REVISE без чтения и транспорты без статистики guard не трогает; hybrid требует признание «не читано»;
     транспорт ClaudeGlm считает tool_use-блоки потока по потокам;
-  * (8) commit_plan: колонки по заголовку (прецедент amdtdlc `# | файлы | тип | сообщение`), brace-глобы,
+  * (8) commit_plan: колонки по заголовку (прецедент реальной серии `# | файлы | тип | сообщение`), brace-глобы,
     аннотации «(33)», проза вне бэктиков; `commit-by-plan --yes` — all-or-nothing (+ `--allow-partial`);
   * (9) merge: застейдженный индекс основного дерева — отказ с понятным сообщением (в т.ч. dry-run);
   * (10) правила длинных прогонов на стенде в промптах исполнителя (auto/on/off).
@@ -41,28 +41,28 @@ from tests.unit.test_duo_pipev3 import (
 # (8) commit_plan: колонки по заголовку, глобы
 # ---------------------------------------------------------------------------
 
-AMDTDLC_TABLE = """# отчёт
+PRECEDENT_TABLE = """# отчёт
 
 ## commit_plan
 
 | # | файлы | тип | сообщение |
 |---|-------|-----|-----------|
 | 1 | `tools/amd/run_s5.sh`, `tools/amd/lab/*.py` | feat | feat(amd): стенд ступени 5 |
-| 2 | `pipeline/amdtdlc/{plan_v1,impl_report_v1}.md` (33) untracked серии | docs | docs(amdtdlc): план и отчёт |
+| 2 | `pipeline/demo/{plan_v1,impl_report_v1}.md` (33) untracked серии | docs | docs(demo): план и отчёт |
 | 3 | tools/amd/readme.md ; tools/amd/notes/ | docs | docs(amd): заметки |
 """
 
 
-def test_parse_commit_plan_header_columns_amdtdlc_precedent():
+def test_parse_commit_plan_header_columns_precedent():
     """Раньше позиционный разбор брал «тип» за сообщение, а `{a,b}` и «(33)» ломали глобы."""
-    groups, warnings = duo.parse_commit_plan(AMDTDLC_TABLE)
+    groups, warnings = duo.parse_commit_plan(PRECEDENT_TABLE)
     assert warnings == []
     assert [g["name"] for g in groups] == ["1", "2", "3"]
     assert [g["message"] for g in groups] == [
-        "feat(amd): стенд ступени 5", "docs(amdtdlc): план и отчёт", "docs(amd): заметки"]
+        "feat(amd): стенд ступени 5", "docs(demo): план и отчёт", "docs(amd): заметки"]
     assert [g["rationale"] for g in groups] == ["feat", "docs", "docs"]            # «тип» → rationale
     assert groups[0]["globs"] == ["tools/amd/run_s5.sh", "tools/amd/lab/*.py"]
-    assert groups[1]["globs"] == ["pipeline/amdtdlc/plan_v1.md", "pipeline/amdtdlc/impl_report_v1.md"]
+    assert groups[1]["globs"] == ["pipeline/demo/plan_v1.md", "pipeline/demo/impl_report_v1.md"]
     assert groups[2]["globs"] == ["tools/amd/readme.md", "tools/amd/notes/*"]      # каталог → dir/*
 
 
@@ -192,7 +192,7 @@ def test_commit_by_plan_yes_allow_partial_commits_valid_groups(tmp_path: Path, c
     assert "stray.py" in _git_out(repo, "status", "--porcelain")
 
 
-def test_commit_by_plan_amdtdlc_table_end_to_end(tmp_path: Path):
+def test_commit_by_plan_precedent_table_end_to_end(tmp_path: Path):
     """Таблица-прецедент целиком: колонки по заголовку, brace-глоб, аннотация — 3 коммита, а не один «docs»."""
     cfg, repo, n0 = _commit_cfg_repo(
         tmp_path,

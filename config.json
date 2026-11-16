@@ -22,7 +22,7 @@
   "parallel": {
     "shared_ok": [],
     "sync_base_at_impl": true,
-    "_comment": "параллельные серии (run --worktree): shared_ok — globs файлов, пересечение по которым НЕ блокирует старт имплементации (напр. doc/99-TODO.md); sync_base_at_impl — перед первой имплементацией подтянуть базу worktree к HEAD основного дерева (только fast-forward и только при чистом worktree)"
+    "_comment": "параллельные серии (run --worktree): shared_ok — globs файлов, пересечение по которым НЕ блокирует старт имплементации (напр. doc/TODO.md); sync_base_at_impl — перед первой имплементацией подтянуть базу worktree к HEAD основного дерева (только fast-forward и только при чистом worktree)"
   },
   "limits": {
     "max_plan_iterations": 24,
@@ -45,7 +45,7 @@
   "claude_env_full": {
     "CLAUDE_STREAM_IDLE_TIMEOUT_MS": "900000",
     "CLAUDE_BYTE_STREAM_IDLE_TIMEOUT_MS": "900000",
-    "_comment": "только исполнитель (mode=full); пол встроенного idle-watchdog стрима claude CLI = 300 с → «API Error: The operation timed out.» на длинных генерациях через Z.AI (ingests4b 17.10.2026, дважды: обрыв через 245 и 284 с тишины)"
+    "_comment": "только исполнитель (mode=full); пол встроенного idle-watchdog стрима claude CLI = 300 с → «API Error: The operation timed out.» на длинных генерациях через Z.AI (боевой инцидент 17.10.2026, дважды: обрыв через 245 и 284 с тишины)"
   },
   "git": {
     "auto_branch": true,

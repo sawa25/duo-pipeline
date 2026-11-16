@@ -44,8 +44,8 @@ MANIFEST_HEADER = "name\tfiles\traw_bytes\ttar_bytes\tsha256"
 ZSTD_ARGS = ("-T0", "-6", "-q")          # уровень/потоки как в make_snapshots.sh (-T4 -6 -q)
 
 # R6 (duoportable): охранный обход конфигурируем. Встроенный набор — нейтральные
-# служебные каталоги любого git-проекта; vca-специфика (data, models, egg-info,
-# doc/99-TODO.md, a3_registry.json) живёт в archive.guard_skip_dirs /
+# служебные каталоги любого git-проекта; проектная специфика (тяжёлые каталоги данных,
+# egg-info, файлы-указатели вроде TODO) живёт в archive.guard_skip_dirs /
 # archive.guard_exempt_files конфига ПРОЕКТА (.duo/config.json) и ДОПОЛНЯЕТ builtin.
 GUARD_SKIP_DIRS_BUILTIN = {
     ".git", ".worktrees", "node_modules", "dist", "build", "__pycache__",

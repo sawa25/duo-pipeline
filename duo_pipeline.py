@@ -157,11 +157,11 @@ DEFAULTS = {
         # (вместо тихого продолжения до лимита). До этого порога — обычный
         # цикл доработок (legacy-поведение при escalation_after=None).
         "escalation_after": None,
-        # ingests4b (17.10.2026): число повторов вызова исполнителя при транспортном сбое
+        # боевой инцидент (17.10.2026): число повторов вызова исполнителя при транспортном сбое
         # claude CLI («API Error: …») с resume той же сессии; 0 = прежнее поведение
         # (ошибка сразу уходит в «артефакт не найден» → needs_human)
         "executor_api_retries": 0,
-        # pipework3 (21.10.2026, ingests6: ответ исполнителя v2 оборвался на полуслове,
+        # pipework3 (21.10.2026, боевой инцидент: ответ исполнителя v2 оборвался на полуслове,
         # impl_report_v2.md не записан → СТОП «артефакт не найден»): число «дожимающих»
         # ходов (resume той же сессии), если после шага исполнителя обязательный артефакт
         # (plan_vN.md / impl_report_vN.md) не появился. 0 = прежнее поведение.
@@ -197,9 +197,12 @@ DEFAULTS = {
     },
     # R3 (duoportable): гейты полностью из конфига. steps — список {name, argv, pp, timeout,
     # summary}; плейсхолдеры argv: {py} (интерпретатор), {pybin} (его каталог), {cpus}.
-    # python: None → sys.executable; stubs: None → <каталог оркестратора>/gate_stubs,
-    # "" → заглушки не подмешиваются. Шагов нет → `gates` отвечает rc=2 с подсказкой.
-    "gates": {"cpus": "0-11", "python": None, "stubs": None, "steps": []},
+    # python: None → sys.executable (интерпретатор оркестратора = выбор лаунчера bin/duo на
+    # КАЖДОЙ машине; в проектном конфиге ключ обычно не задаётся — он непереносим между стендами);
+    # cpus: None → $DUO_GATES_CPUS (машинная настройка), иначе все доступные процессу ядра; stubs: None/"" → заглушек нет, иначе каталог
+    # пакетов-заглушек (относительный путь — от корня проекта). Шагов нет → `gates` отвечает
+    # rc=2 с подсказкой.
+    "gates": {"cpus": None, "python": None, "stubs": None, "steps": []},
     # R5 (duoportable): пути, которые ревьюер НЕ имеет права откатывать (правки хозяина/
     # оркестратора легитимны): относительно корня repo, fnmatch-глобы допустимы
     "guard": {"never_revert": []},
@@ -208,7 +211,7 @@ DEFAULTS = {
         "pack_max_chars": 60000,
         "plan_policy": "triage",         # triage | legacy: фаза plan по блокерам, эрраты не блокируют (PLAN_POLICY_*)
         "impl_policy": "strict",         # strict | legacy: факт-вывод тестов в отчёте, фикс класса дефекта (IMPL_POLICY_*)
-        # guard пустого ревью (pair, 29.10.2026; инцидент amdtdlc: ACCEPT без единого чтения файла).
+        # guard пустого ревью (pair, 29.10.2026; боевой инцидент: ACCEPT без единого чтения файла).
         # ACCEPT при нуле обращений к инструментам не засчитывается: один повтор с жёстким
         # напоминанием, затем halt kind=review_empty. enabled=false — прежнее поведение.
         "empty_guard": {"enabled": True, "retries": 1},
@@ -221,6 +224,9 @@ DEFAULTS = {
     # правила длинных прогонов на стенде для исполнителя (EXECUTOR_LONG_RUN_RULES):
     # auto — добавлять, если task.md упоминает ssh/стенд/AMD/nohup/setsid; on | off — принудительно
     "executor_long_run_rules": "auto",
+    # свои слова-маркеры для режима auto (имена хостов/стендов проекта): задание, где они
+    # встречаются, получает правила длинных прогонов; встроенный набор — LONG_RUN_TASK_RE
+    "executor_long_run_markers": [],
     # pipework3: штатный надзор (`wait`, `supervise`, liveness в `status`) вместо внешних bash-сторожей
     "supervisor": {
         "stale_sec": 300,               # state не обновлялся дольше И .lock свободен → оркестратор мёртв
@@ -459,7 +465,7 @@ class ClaudeGlm:
         self._tls = threading.local()           # статистика вызова: свой счётчик у каждого потока
 
     # --- статистика обращений к инструментам (guard пустого ревью, 29.10.2026) -------------
-    # Инцидент amdtdlc: проверяющий вернул ACCEPT, не прочитав ни одного файла («нет инструментов»),
+    # Боевой инцидент: проверяющий вернул ACCEPT, не прочитав ни одного файла («нет инструментов»),
     # и вердикт был принят «по букве протокола». Транспорт теперь считает tool_use-блоки потока;
     # DuoReviewer сбрасывает счётчик перед вызовом и забирает после (потокобезопасно).
 
@@ -485,7 +491,7 @@ class ClaudeGlm:
         # claude_env_full — только для вызовов исполнителя (mode="full"): длинные
         # генерации (отчёты/тесты) упираются во встроенный idle-watchdog стрима
         # claude CLI (пол 300 с без байт; повышается лишь CLAUDE_STREAM_IDLE_TIMEOUT_MS)
-        # → «API Error: The operation timed out.» (ingests4b, 17.10.2026, дважды).
+        # → «API Error: The operation timed out.» (боевой инцидент 17.10.2026, дважды).
         # Ревьюеры (mode="plan") и председатель не затронуты.
         if mode == "full":
             for k, v in (self.cfg.get("claude_env_full") or {}).items():
@@ -652,8 +658,8 @@ def load_member(cfg: dict, name: str) -> dict:
 class GitGuard:
     def __init__(self, repo: Path, never_revert: tuple[str, ...] | list[str] = ()):
         # R5 (duoportable): пути, защищённые от отката, приходят из конфига
-        # (guard.never_revert; в vca так был защищён каталог оркестратора в дереве
-        # проекта). Юнит-тесты могут звать без списка — дефолт пуст.
+        # (guard.never_revert; напр. каталог кода, лежащий в дереве самого проекта).
+        # Юнит-тесты могут звать без списка — дефолт пуст.
         self.repo = repo
         self.never_revert = tuple(never_revert)
 
@@ -879,7 +885,7 @@ REVIEWER_STUB_RETRY_SUFFIX = (
 )
 
 # Транспортный сбой claude CLI: текст результата целиком = «API Error: <причина>»
-# (например «The operation timed out.» — idle-watchdog стрима, ingests4b 17.10.2026).
+# (например «The operation timed out.» — idle-watchdog стрима, боевой инцидент 17.10.2026).
 # Узкая сигнатура — только начало ответа: нормальный ответ, где фраза встречается
 # внутри текста (цитата лога), не срабатывает.
 API_ERROR_RE = re.compile(r"^\s*API Error\b", re.IGNORECASE)
@@ -918,7 +924,7 @@ def is_api_error_text(text: str | None) -> bool:
     return bool(text) and bool(API_ERROR_RE.match(text))
 
 
-# --- guard пустого ревью (29.10.2026, инцидент amdtdlc rev001_impl) ---------------------------
+# --- guard пустого ревью (29.10.2026, боевой инцидент: ревью impl) ---------------------------
 # Проверяющий вернул «VERDICT: ACCEPT», признав в тексте «нет инструментов / файл не читан», и
 # оркестратор принял вердикт «по букве протокола». Критерий пустоты — ФАКТ из транспорта (число
 # tool_use-блоков в потоке), а не слова ревьюера; слова — только вспомогательный признак там, где
@@ -962,7 +968,7 @@ def empty_review_reason(cfg: dict, verdict: str | None, report: str, stats: dict
 
 
 # --- правила длинных прогонов на стенде для исполнителя (29.10.2026, грабли 6–10) ----------------
-# Источник — реальные потери серий speedlim/m2group/amdtdlc: драйвер, убитый вместе с сессией ssh;
+# Источник — реальные потери серий (боевая эксплуатация): драйвер, убитый вместе с сессией ssh;
 # скрипт, перезаписанный под работающим драйвером; запятая вместо точки в замерах (локаль);
 # flock-дескриптор, унаследованный фоновым ребёнком; серия без impl_report при живых прогонах.
 EXECUTOR_LONG_RUN_RULES = """
@@ -976,17 +982,22 @@ EXECUTOR_LONG_RUN_RULES = """
 - ОБЯЗАТЕЛЬНЫЙ артефакт `impl_report_vN.md` пиши РАНО и обновляй по ходу (первый вариант — сразу после запуска прогонов: что запущено, PID, ожидаемое окончание, критерии), а не «когда всё досчитается»: серия без отчёта при живых прогонах — остановка `artifact_missing`.
 """
 
-LONG_RUN_TASK_RE = re.compile(r"\bssh\b|стенд|\bAMD\b|\bamd\b|nohup|setsid|minis|aspek@", re.IGNORECASE)
+LONG_RUN_TASK_RE = re.compile(r"\bssh\b|стенд|\bAMD\b|\bamd\b|nohup|setsid", re.IGNORECASE)
 
 
 def long_run_rules_enabled(cfg: dict, task_text: str) -> bool:
-    """executor_long_run_rules: on | off | auto (auto — если задание упоминает ssh/стенд/AMD/nohup…)."""
+    """executor_long_run_rules: on | off | auto (auto — если задание упоминает ssh/стенд/AMD/nohup…
+    либо слово из executor_long_run_markers проекта)."""
     mode = str(cfg.get("executor_long_run_rules", "auto")).lower()
     if mode in ("on", "true", "1"):
         return True
     if mode in ("off", "false", "0"):
         return False
-    return bool(LONG_RUN_TASK_RE.search(task_text or ""))
+    if LONG_RUN_TASK_RE.search(task_text or ""):
+        return True
+    extras = [str(m) for m in (cfg.get("executor_long_run_markers") or []) if str(m)]
+    return bool(extras) and bool(re.search("|".join(re.escape(m) for m in extras), task_text or "",
+                                           re.IGNORECASE))
 
 
 def plan_triage_enabled(cfg: dict) -> bool:
@@ -2252,7 +2263,7 @@ VERDICT: REVISE"""
         self._acc(cost)
         guard.enforce_readonly(before, artifacts_rel, self.task_dir)
         stats = self._take_tool_stats()
-        # guard пустого ревью: ACCEPT при нуле tool_use — вакуумный вердикт (amdtdlc rev001_impl).
+        # guard пустого ревью: ACCEPT при нуле tool_use — вакуумный вердикт (боевой инцидент).
         # Один повтор с жёстким напоминанием; не помогло — EmptyReviewError → halt review_empty.
         guard_cfg = ctx_cfg.get("empty_guard") if isinstance(ctx_cfg.get("empty_guard"), dict) else {}
         max_retry = int(guard_cfg.get("retries", 1) or 0)
@@ -2376,7 +2387,7 @@ class Executor:
         """pipework3: постусловие шага исполнителя — обязательный артефакт (plan_vN.md /
         impl_report_vN.md) записан на диск и не пуст.
 
-        Инцидент ingests6 (21.10.2026): ответ исполнителя v2 оборвался на полуслове
+        Боевой инцидент (21.10.2026): ответ исполнителя v2 оборвался на полуслове
         («Исправление логики и»), result-событие всё же пришло → оркестратор принял это за
         успех, отправился в ревью и остановился «артефакт не найден»; человек гнал rework с
         нуля (свежая сессия, ещё $8). Теперь: нет файла → до limits.executor_continue_retries
@@ -2425,7 +2436,7 @@ class Executor:
     def _wt_block(self) -> str:
         """Изоляция worktree (параллельные серии): пусто в shared — промпты байт-в-байт прежние.
         R7: проектная подсказка (сервисы, которые нельзя перезапускать) — ключ
-        executor_worktree_note; для vca он воспроизводит прежний хвост дословно."""
+        executor_worktree_note (пусто → блок без проектной приписки)."""
         if not self._is_worktree():
             return ""
         branch = f"{(self.cfg.get('git') or {}).get('branch_prefix', 'duo/')}{self.state.get('task', '')}"
@@ -2559,7 +2570,7 @@ SOLO_DONE
 VALID_MODES = ("duo", "pair", "solo")
 VALID_ISOLATIONS = ("shared", "worktree")
 
-# грабля 11 (30.10.2026, tdlcguard): план писал `## 12. files_touch` — секция не находилась,
+# грабля 11 (30.10.2026, боевой случай): план писал `## 12. files_touch` — секция не находилась,
 # зона занимала 0 путей и claim-gate никого не защищал. Терпим необязательный номер заголовка
 # (`## 12. files_touch`, `## 5) files_touch`, `## 12.files_touch`); files_touch обязан быть
 # первым словом после номера — `## 12. files_touch_notes`/`## 12. Зона записи files_touch`
@@ -3908,7 +3919,7 @@ class Pipeline:
 COMMIT_PLAN_HEADER = re.compile(r"^##[ \t]+(?:\d+[.)][ \t]*)?commit_plan[ \t]*:?[ \t]*$", re.I)
 
 
-# Заголовки колонок commit_plan (грабли 8, 29.10.2026): исполнитель amdtdlc записал таблицу
+# Заголовки колонок commit_plan (грабли 8, 29.10.2026): исполнитель записал таблицу
 # `# | файлы | тип | сообщение` с brace-глобом `{plan_v1,impl_report_v1}.md` и аннотацией «(33)»;
 # позиционный разбор взял «тип» за сообщение, а `commit-by-plan --yes` молча сделал один
 # «docs»-коммит. Теперь колонки определяются по ЗАГОЛОВКУ (позиционный разбор — запасной путь).
@@ -4455,7 +4466,7 @@ def cmd_commit_by_plan(cfg: dict, args) -> None:
         sys.exit(1)
 
     # preflight «всё или ничего» для --yes (грабли 8, 29.10.2026): без интерактива некому остановить
-    # кривую таблицу — amdtdlc получил один «docs»-коммит вместо шести. Любая аномалия плана →
+    # кривую таблицу — серия получила один «docs»-коммит вместо шести. Любая аномалия плана →
     # отказ ДО первого коммита; осознанный частичный прогон — `--allow-partial`.
     if yes_all and not getattr(args, "allow_partial", False):
         # devhyg: группа из одних артефактных глобов — не «пустая» ошибка (артефакты
@@ -5138,7 +5149,7 @@ def _merge_locked(cfg: dict, args, p: Pipeline) -> int:
             print(f"Закоммить их (`commit-by-plan --task {task}`), затем повтори merge")
             return 1
     # грабли 9 (29.10.2026): `git merge` отказывает при ЛЮБОМ застейдженном-незакоммиченном в индексе
-    # основного дерева (даже в файлах, которых слияние не касается; в amdtdlc отказ пришёл со списком
+    # основного дерева (даже в файлах, которых слияние не касается; в боевой серии отказ пришёл со списком
     # чужих patch-файлов). Видно заранее — и в --dry-run, который иначе «проходил» и обманывал.
     rc, staged = sh(["git", "diff", "--cached", "--name-only"], cwd=repo)
     if rc == 0 and staged.strip():
@@ -5291,23 +5302,43 @@ def cmd_claims(cfg: dict, args) -> None:
 # ----------------------------------------------------------------------------
 
 
+def _default_cpus() -> str:
+    """Все ядра, доступные процессу, строкой для `taskset -c` ("0-31" или "0-3,8-11").
+    Умолчание вместо зашитого списка: фиксированный набор ядер невалиден на машине поменьше."""
+    try:
+        ids = sorted(os.sched_getaffinity(0))
+    except (AttributeError, OSError):
+        ids = list(range(os.cpu_count() or 1))
+    runs: list[tuple[int, int]] = []
+    start = prev = ids[0]
+    for i in ids[1:]:
+        if i == prev + 1:
+            prev = i
+            continue
+        runs.append((start, prev))
+        start = prev = i
+    runs.append((start, prev))
+    return ",".join(str(a) if a == b else f"{a}-{b}" for a, b in runs)
+
+
 def _gates_resolve(cfg: dict) -> dict:
     """Параметры гейтов из конфига (R3): шаги с раскрытыми плейсхолдерами, интерпретатор,
-    каталог заглушек. gates.python: None/отсутствует → sys.executable; gates.stubs:
-    None → <каталог оркестратора>/gate_stubs, "" → заглушки выключены, путь → путь."""
+    каталог заглушек. gates.python: None/отсутствует → sys.executable; gates.cpus: None →
+    $DUO_GATES_CPUS (машинная настройка), иначе все доступные ядра (_default_cpus); gates.stubs: None/"" → заглушек нет, абсолютный путь →
+    он же, относительный → от корня проекта (cfg["repo"])."""
     gates = cfg.get("gates") or {}
     # абсолютный путь БЕЗ раскрытия симлинков: python venv — симлинк на системный интерпретатор,
     # resolve() увёл бы {pybin} в чужой каталог (нет ruff/mypy, пропали бы пакеты venv)
     py = Path(os.path.abspath(str(gates.get("python") or sys.executable)))
     pybin = py.parent
-    cpus = str(gates.get("cpus", "0-11"))
+    cpus = str(gates.get("cpus") or os.environ.get("DUO_GATES_CPUS") or _default_cpus())
     stubs = gates.get("stubs")
-    if stubs is None:
-        stubs_dir: Path | None = SCRIPT_DIR / "gate_stubs"
-    elif str(stubs) == "":
+    stubs_dir: Path | None
+    if stubs is None or str(stubs) == "":
         stubs_dir = None
     else:
-        stubs_dir = Path(str(stubs))
+        sp = Path(str(stubs))
+        stubs_dir = sp if sp.is_absolute() else Path(cfg.get("repo") or os.getcwd()).resolve() / sp
     steps = []
     for raw in gates.get("steps") or []:
         argv = [str(a).replace("{py}", str(py)).replace("{pybin}", str(pybin))
@@ -5363,6 +5394,12 @@ def cmd_gates(cfg: dict, args, runner: Callable | None = None) -> int:
     if not steps:
         print("gates.steps не заданы в .duo/config.json (пример — docs/PROJECT-SETUP.md)")
         return 2
+    cfg_py = (cfg.get("gates") or {}).get("python")
+    if cfg_py and not os.access(g["py"], os.X_OK):
+        sys.exit(f"gates.python={g['py']} не найден или не исполняем (другой стенд? путь интерпретатора "
+                 f"непереносим между машинами). Уберите ключ из .duo/config.json: тогда гейты идут тем "
+                 f"интерпретатором, что запустил оркестратор (сейчас {sys.executable}; на машине "
+                 f"его выбирает лаунчер bin/duo или переменная DUO_PYTHON).")
     if stubs_dir is not None and not stubs_dir.is_dir():
         sys.exit(f"нет каталога заглушек {stubs_dir} (gates.stubs в конфиге)")
     branch = f"{cfg['git']['branch_prefix']}{args.task}"

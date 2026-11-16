@@ -36,7 +36,7 @@
 скармливать `notify_on_output` (паттерн `WAIT-RESULT`), а в обычном режиме — блокирующим вызовом:
 
 ```bash
-cd /home/sawa/GitHub/<проект>
+cd /путь/к/проекту
 duo wait --task <task> --poll 30
 # фон + событийный сигнал агенту:  notify_on_output pattern "WAIT-RESULT|Error|Traceback"
 ```
@@ -54,7 +54,7 @@ duo wait --task <task> --poll 30
 Установка (идемпотентно; заменяет и снимает старый `duo-watchdog-failsafe.timer`):
 
 ```bash
-bash /home/sawa/GitHub/duo-pipeline/systemd/install.sh
+bash $DUO_HOME/install.sh --systemd
 journalctl --user -u duo-supervise.service -n 5 --no-pager      # вывод последнего тика
 systemctl --user list-timers 'duo-supervise*' --no-pager        # следующее срабатывание
 duo supervise --dry-run   # что сделал бы надзор (ничего не меняет; без --repo — по реестру проектов)

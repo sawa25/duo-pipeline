@@ -116,14 +116,14 @@ def _add_series(repo: Path, task: str, *, merged_days_ago: int | None = 20,
 
 def _series_repo(tmp_path: Path, task: str = "demo", **kw) -> tuple[Path, dict, Path, Path]:
     """Песочница: репо + одна зелёная серия + cfg + корень архива в tmp_path.
-    cfg несёт проектный слой охраны (R6): doc/99-TODO.md — легальное исключение
-    этого проекта (раньше было hardcoded, теперь — .duo/config.json)."""
+    cfg несёт проектный слой охраны (R6): doc/TODO.md — легальное исключение
+    проекта (задаётся в .duo/config.json, в коде не зашито)."""
     repo = _init_repo(tmp_path)
     (repo / "pipeline" / "archive").mkdir(parents=True)
     (repo / "pipeline" / "archive" / "ARCHIVED.txt").write_text("aaa\nzzz\n", encoding="utf-8")
     _add_series(repo, task, **kw)
     cfg = _cfg(tmp_path, repo)
-    cfg["archive"] = {"guard_exempt_files": ["doc/99-TODO.md"]}
+    cfg["archive"] = {"guard_exempt_files": ["doc/TODO.md"]}
     return repo, cfg, repo / "pipeline" / task, tmp_path / "archroot"
 
 
@@ -301,22 +301,22 @@ def test_refusal_digest_placeholder(tmp_path):
 
 
 def test_refusal_refs_outside(tmp_path):
-    """Указатель pipeline/demo вне pipeline/ блокирует; doc/99-TODO.md — легальное
+    """Указатель pipeline/demo вне pipeline/ блокирует; doc/TODO.md — легальное
     исключение ИЗ КОНФИГА проекта (R6): без archive.guard_exempt_files он блокирует."""
     repo, cfg, td, archroot = _series_repo(tmp_path)
-    todo = repo / "doc" / "99-TODO.md"
+    todo = repo / "doc" / "TODO.md"
     todo.parent.mkdir()
     todo.write_text("п.3: см. pipeline/demo/plan_v1.md\n", encoding="utf-8")
     rc, out = _run(cfg, "demo", dry_run=True, archive_root=str(archroot))
-    assert rc == 0, f"99-TODO — исключение из cfg песочницы, блокировать нельзя: {out}"
+    assert rc == 0, f"TODO — исключение из cfg песочницы, блокировать нельзя: {out}"
     notes = repo / "doc" / "notes.md"
     notes.write_text("см. также pipeline/demo/impl_report_v1.md\n", encoding="utf-8")
     rc, out = _run(cfg, "demo", dry_run=True, archive_root=str(archroot))
     assert rc == 1 and "указатели" in out and "doc/notes.md" in out
-    # без проектного исключения (стирли ключ) тот же 99-TODO — уже указатель-блокер
+    # без проектного исключения (стирли ключ) тот же TODO — уже указатель-блокер
     cfg["archive"] = {}
     rc, out = _run(cfg, "demo", dry_run=True, archive_root=str(archroot))
-    assert rc == 1 and "doc/99-TODO.md" in out
+    assert rc == 1 and "doc/TODO.md" in out
 
 
 def test_refusal_untracked_dir(tmp_path):
@@ -544,16 +544,16 @@ def test_archived_txt_sorted_unique(tmp_path):
 
 def test_guard_sets_builtin_plus_config():
     """R6: эффективные наборы охраны = нейтральный builtin ∪ значения конфига проекта ∪
-    каталог артефактов; vca-специфика (data/models/99-TODO) в коде больше не живёт.
+    каталог артефактов; проектная специфика (data/models/TODO) в коде не живёт.
     Паттерн указателя — дословно как в удалённом охранном тесте tests/arch."""
     assert "node_modules" in arc.GUARD_SKIP_DIRS_BUILTIN
-    assert not ({"data", "models", "vca_platform.egg-info"} & arc.GUARD_SKIP_DIRS_BUILTIN)
+    assert not ({"data", "models", "myproj.egg-info"} & arc.GUARD_SKIP_DIRS_BUILTIN)
     assert arc.GUARD_EXEMPT_FILES_BUILTIN == set()
     skip, exempt = arc.guard_sets({"artifacts_dir": "pipeline",
                                    "archive": {"guard_skip_dirs": ["data", "models"],
-                                               "guard_exempt_files": ["doc/99-TODO.md"]}})
+                                               "guard_exempt_files": ["doc/TODO.md"]}})
     assert {"pipeline", "data", "models", ".git", "node_modules"} <= skip
-    assert exempt == {"doc/99-TODO.md"}
+    assert exempt == {"doc/TODO.md"}
     # дефолт прямых вызовов scan_series_refs — builtin + каталог артефактов по умолчанию
     assert arc.GUARD_SKIP_DIRS == arc.GUARD_SKIP_DIRS_BUILTIN | {"pipeline"}
     assert arc.GUARD_EXEMPT_FILES == set()
@@ -562,12 +562,12 @@ def test_guard_sets_builtin_plus_config():
     assert arc._refs_pattern(["x1", "x 2"]).pattern == r"pipeline/(x1|x\ 2)(/|\b)"
 
 
-def test_guard_contract_literals_pinned_for_vca_counterpart():
-    """Контракт охраны архива — ДВУСТОРОННИЙ пин. Охранный тест проекта (vca:
-    tests/arch/test_archived_series_refs.py) и его проверка соответствия конфигу
-    (tests/arch/test_archive_guard_config_sync.py в vca) держат ТЕ ЖЕ литералы. CI проекта не
-    исполняет код инструмента, а CI инструмента (make check) не видит тест проекта, поэтому
-    сверка идёт через общие литералы: изменили здесь — поправьте vca-тест, и наоборот."""
+def test_guard_contract_literals_pinned_for_project_counterpart():
+    """Контракт охраны архива — ДВУСТОРОННИЙ пин. Охранный тест проекта-потребителя (проверка,
+    что в коде проекта нет ссылок на архивные серии) и его проверка соответствия конфигу держат
+    ТЕ ЖЕ литералы. CI проекта не исполняет код инструмента, а CI инструмента (make check) не
+    видит тест проекта, поэтому сверка идёт через общие литералы: изменили здесь — поправьте
+    тест проекта-потребителя, и наоборот."""
     assert arc.GUARD_SKIP_DIRS_BUILTIN == {
         ".git", ".worktrees", "node_modules", "dist", "build", "__pycache__",
         ".ruff_cache", ".mypy_cache", ".pytest_cache", ".venv", "venv",
@@ -582,7 +582,7 @@ def test_guard_contract_literals_pinned_for_vca_counterpart():
 
 def test_merge_target_refs_builtin_plus_config(tmp_path: Path):
     """Ветки слияния: нейтральный builtin (HEAD, main) ∪ archive.merge_target_refs проекта;
-    vca-ветка dev/speedlim в коде больше не живёт. merged_into учитывает переданный набор."""
+    проектные ветки в коде не живут. merged_into учитывает переданный набор."""
     assert arc.MERGE_TARGET_REFS == ("HEAD", "main")
     assert arc.merge_target_refs({}) == ("HEAD", "main")
     assert arc.merge_target_refs({"archive": {"merge_target_refs": ["dev/x", "main", "", 7]}}) == (
