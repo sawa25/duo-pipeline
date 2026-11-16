@@ -5296,7 +5296,9 @@ def _gates_resolve(cfg: dict) -> dict:
     каталог заглушек. gates.python: None/отсутствует → sys.executable; gates.stubs:
     None → <каталог оркестратора>/gate_stubs, "" → заглушки выключены, путь → путь."""
     gates = cfg.get("gates") or {}
-    py = Path(str(gates.get("python") or sys.executable)).resolve()
+    # абсолютный путь БЕЗ раскрытия симлинков: python venv — симлинк на системный интерпретатор,
+    # resolve() увёл бы {pybin} в чужой каталог (нет ruff/mypy, пропали бы пакеты venv)
+    py = Path(os.path.abspath(str(gates.get("python") or sys.executable)))
     pybin = py.parent
     cpus = str(gates.get("cpus", "0-11"))
     stubs = gates.get("stubs")

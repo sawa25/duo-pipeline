@@ -33,8 +33,8 @@ from tests.unit.test_duo_pipework2 import _set_state
 REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 STUBS = REPO_ROOT / "gate_stubs"
 STUB_PKGS = ("llama_cpp", "onnx", "onnxruntime", "pynvml", "torch")
-PYBIN = Path(sys.executable).resolve().parent
-PY = Path(sys.executable).resolve()   # {py} по умолчанию = sys.executable, резолвится
+PY = Path(os.path.abspath(sys.executable))   # {py} по умолчанию = sys.executable, БЕЗ раскрытия симлинков
+PYBIN = PY.parent
 
 
 def _gates_ns(task="demo", ref=None, name=None, only=None, extra=None, dry_run=False, keep=False):
@@ -143,6 +143,18 @@ def test_gates_steps_from_config_byte_exact():
                   "-m", "integration and not gpu"]},
     ]
     assert duo.gates_steps({"gates": {"cpus": "0-11", "steps": _vca_steps()}}) == pinned
+
+
+def test_gates_python_symlink_not_resolved(tmp_path: Path):
+    """python venv — симлинк на системный интерпретатор: {py}/{pybin} обязаны остаться в каталоге
+    venv (там ruff/mypy/пакеты), а не уйти в каталог цели симлинка (resolve() ломал venv-проекты)."""
+    venv_bin = tmp_path / "venv" / "bin"
+    venv_bin.mkdir(parents=True)
+    (venv_bin / "python").symlink_to(Path(sys.executable).resolve())
+    g = duo._gates_resolve({"gates": {"python": str(venv_bin / "python"), "cpus": "0-1",
+                                      "steps": [{"name": "r", "argv": ["{pybin}/ruff", "{py}", "{cpus}"]}]}})
+    assert g["py"] == venv_bin / "python" and g["pybin"] == venv_bin
+    assert g["steps"][0]["argv"] == [f"{venv_bin}/ruff", f"{venv_bin}/python", "0-1"]
 
 
 def test_gates_no_steps_rc2_hint(tmp_path: Path, capsys):
