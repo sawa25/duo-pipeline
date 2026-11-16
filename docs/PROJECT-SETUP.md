@@ -36,6 +36,9 @@ duo setup                # в каталоге проекта
 
 **После `setup` закоммить `.duo/` и `.gitignore` ДО первой серии.** Незакоммиченные файлы
 `commit-by-plan --yes` считает «не покрытыми» и отказывает (all-or-nothing).
+**Но не коммить `pipeline/<task>/` (в т.ч. заранее написанный `task.md`) для worktree-серии до её `merge`:**
+в worktree этот каталог обязан быть симлинком на основное дерево, и закоммиченный в базе — `init --worktree`/`run`
+отказывают. Артефакты ДРУГИХ серий `commit-by-plan` блокирующими не считает.
 
 Дальше: `duo init --task <имя>` → `duo run --task <имя>` (как обычно,
 см. шпаргалку). Управление реестром: `duo projects [--add PATH] [--remove PATH]
@@ -99,7 +102,9 @@ duo setup                # в каталоге проекта
 `contracts` — строки контрактов lint-imports). Плейсхолдеры в `argv`:
 `{py}` — полный путь интерпретатора, `{pybin}` — его каталог, `{cpus}` —
 `gates.cpus`. Прогон — в чистой копии (`git archive REF` + файлы серии):
-`duo gates --task X [--ref REF] [--only ruff,unit] [--extra …] [--dry-run]`.
+`duo gates --task X [--ref REF] [--only ruff,unit] [--extra файлы|каталоги] [--dirty] [--dry-run]`.
+Для серии с незакоммиченным кодом без `--dirty`/`--extra` проверяется бейзлайн `HEAD` — `gates` об этом
+предупреждает (ВНИМАНИЕ + `WARN` в `summary.txt`); `--dirty` накладывает правки дерева серии.
 Пустой `gates.steps` → rc=2 с подсказкой (проект без гейтов — нормальная
 ситуация). Полный набор аргументов — `duo gates --help`.
 

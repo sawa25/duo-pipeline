@@ -431,6 +431,25 @@ def sh(cmd: list[str], cwd: Path | None = None, timeout: int = 120) -> tuple[int
     return p.returncode, (p.stdout or "") + (p.stderr or "")
 
 
+def artifacts_tracked_in_ref(repo: Path, ref: str, arts_rel: str) -> list[str]:
+    """Файлы каталога артефактов серии, закоммиченные в ref (git ls-tree). Для worktree-серии
+    это конфликт: в её worktree `<artifacts>/<task>` обязан быть симлинком на основное дерево,
+    а закоммиченный каталог в базе ветки — реальный. Ошибка git → пусто (не блокируем)."""
+    rc, out = sh(["git", "ls-tree", "-r", "--name-only", ref, "--", arts_rel], cwd=repo)
+    return [x for x in out.splitlines() if x.strip()] if rc == 0 else []
+
+
+def worktree_artifacts_conflict_msg(task: str, artifacts_dir: str, tracked: list[str]) -> str:
+    """Единое сообщение для init/run: артефакты worktree-серии закоммичены в базу."""
+    rel = f"{artifacts_dir}/{task}"
+    what = (f"{len(tracked)} файл(ов), напр. {tracked[0]}" if tracked else "реальный каталог в worktree")
+    return (f"worktree-серия {task}: каталог артефактов {rel}/ закоммичен в базу ветки ({what}). В worktree он "
+            f"обязан быть симлинком на основное дерево, поэтому серия не стартует. Варианты: другое имя "
+            f"серии; либо снять каталог с учёта (решение человека: git rm -r --cached {rel} && git commit); "
+            f"либо вести серию без --worktree. Правило: task.md и прочие артефакты worktree-серии "
+            f"коммитить только ПОСЛЕ merge серии.")
+
+
 def is_artifact_path(path: str, artifacts_rel: str) -> bool:
     """pipev3 P1b: единая граница фильтра артефактов задачи.
 
@@ -1478,6 +1497,17 @@ class DuoReviewer:
         self.transcripts.mkdir(exist_ok=True)
         self.spent = 0.0
         self.call_cost = 0.0   # pipev3 P0: per-call аккумулятор текущего review()
+        # события транспорта ревью текущего review() — в телеметрию и в `status --task`
+        # (раньше ретрай заглушки был виден только в orchestrator.log). Ревьюеры идут в потоках.
+        self._ev = {"stub_retries": 0, "transport_retries": 0}
+        self._ev_lock = threading.Lock()
+
+    def _bump(self, key: str) -> None:
+        # устойчив к объекту без __init__ (тесты собирают DuoReviewer через __new__)
+        lock = self.__dict__.setdefault("_ev_lock", threading.Lock())
+        with lock:
+            ev = self.__dict__.setdefault("_ev", {"stub_retries": 0, "transport_retries": 0})
+            ev[key] = ev.get(key, 0) + 1
 
     def _acc(self, cost: float) -> None:
         """pipev3 P0: копим и в кумулятив self.spent, и в per-call self.call_cost
@@ -1514,6 +1544,7 @@ class DuoReviewer:
         if not self._is_stub_response(text):
             return text, cost, prompt
         log(self.task_dir, f"ВНИМАНИЕ: ответ {tag} — заглушка (ExitPlanMode/пусто/API Error) — ретрай с уточнением")
+        self._bump("stub_retries")
         self._save_tr(f"{tag}_attempt1", prompt, text, cost)
         retry_prompt = prompt + REVIEWER_STUB_RETRY_SUFFIX
         text2, _, cost2 = self._transport_retry(
@@ -1535,6 +1566,7 @@ class DuoReviewer:
                 if attempt >= retries:
                     raise
                 attempt += 1
+                self._bump("transport_retries")
                 delay = min(wait * (2 ** (attempt - 1)), 240.0)
                 log(self.task_dir, f"РЕВЬЮ: {what}: {str(e)[:140]} — повтор {attempt}/{retries} через {delay:.0f}с")
                 time.sleep(delay)
@@ -2092,6 +2124,8 @@ VERDICT: REVISE"""
         stateless). Пишет rev-файл.
         """
         self.call_cost = 0.0   # P0: per-call аккумулятор этого review()
+        with self._ev_lock:
+            self._ev = {"stub_retries": 0, "transport_retries": 0}
         if len(members) == 1:
             # режим pair: единственный проверяющий вместо дуэта и председателя
             return self._review_single(
@@ -2166,6 +2200,7 @@ VERDICT: REVISE"""
             "pack_overflow": overflow,
             "read_manifests": {A["name"]: ma, B["name"]: mb} if pack is not None else {},
             "cost_usd": round(self.call_cost, 4),   # P0: per-call, не кумулятив
+            **self._ev,                             # stub_retries / transport_retries
         }
         rev_file.write_text(report, encoding="utf-8")
         return verdict, self.call_cost, telemetry
@@ -2295,6 +2330,7 @@ VERDICT: REVISE"""
             "pack_overflow": overflow,
             "read_manifests": {},
             "cost_usd": round(self.call_cost, 4),
+            **self._ev,                             # stub_retries / transport_retries
         }
         if stats is not None:
             telemetry["tool_uses"] = int(stats.get("tool_uses", 0))
@@ -3085,6 +3121,8 @@ class Pipeline:
         """
         branch = f"{self.cfg['git']['branch_prefix']}{self.task}"
         wt = self.work_path
+        created = False
+        branch_created = False
         if (wt / ".git").exists():
             # переиспользование: базу не меняем (пиннена в state)
             rc, h = sh(["git", "rev-parse", "HEAD"], cwd=wt)
@@ -3097,21 +3135,61 @@ class Pipeline:
             if rc == 0 and cur.strip() == branch:
                 sys.exit(f"ветка {branch} уже checkout в основном дереве — оркестратор "
                          f"в дерево человека не вмешивается; переключись сам или разреши вручную")
-            base = st.setdefault("worktree_base", self.main_guard.head())
+            # висячие записи git о worktree, чей каталог удалили руками (rm -rf), иначе
+            # `worktree add` может отказать «уже зарегистрирован»; чужие живые не трогает
+            sh(["git", "worktree", "prune"], cwd=self.repo)
+            head = self.main_guard.head()
+            if not head:
+                sys.exit("в основном дереве нет коммитов (git rev-parse HEAD пуст): worktree-серии нужен "
+                         "хотя бы один коммит — сделай базовый коммит и повтори")
+            rc_v, _ = sh(["git", "rev-parse", "--verify", "-q", f"refs/heads/{branch}"], cwd=self.repo)
+            branch_existed = rc_v == 0
+            if branch_existed:
+                # ветка с наработками прошлой попытки: пин базы сохраняется (ветка выросла от неё)
+                base = st.setdefault("worktree_base", head)
+            else:
+                # ни worktree, ни ветки нет — пин мог остаться только от прошлой ПРОВАЛЕННОЙ
+                # попытки (Н3, 2026-11): тянуть устаревший пин = собрать серию на старой базе
+                old = st.get("worktree_base")
+                base = head
+                st["worktree_base"] = base
+                if old and old != base:
+                    log(self.task_dir, f"БАЗА: пин worktree_base {str(old)[:10]} устарел (worktree и ветки "
+                                       f"{branch} нет) — пересоздаю от HEAD {base[:10]}")
+            # Н2: артефакты серии в коммитах базы — отказ ДО создания worktree/ветки (раньше
+            # узнавали на provisioning, оставляя ветку-сироту и пин)
+            tracked = artifacts_tracked_in_ref(self.repo, branch if branch_existed else base,
+                                               f"{self.cfg['artifacts_dir']}/{self.task}")
+            if tracked:
+                self.save_state(st)
+                sys.exit(worktree_artifacts_conflict_msg(self.task, self.cfg["artifacts_dir"], tracked))
             self.save_state(st)
-            rc, out = sh(["git", "worktree", "add", str(wt), "-b", branch, base],
-                         cwd=self.repo, timeout=300)
-            if rc != 0:
-                # ветка могла остаться от прошлой (умершей) попытки — цепляем её
-                rc_v, _ = sh(["git", "rev-parse", "--verify", branch], cwd=self.repo)
-                if rc_v == 0:
-                    rc, out = sh(["git", "worktree", "add", str(wt), branch],
-                                 cwd=self.repo, timeout=300)
+            if branch_existed:
+                rc, out = sh(["git", "worktree", "add", str(wt), branch], cwd=self.repo, timeout=300)
+            else:
+                rc, out = sh(["git", "worktree", "add", str(wt), "-b", branch, base],
+                             cwd=self.repo, timeout=300)
+                branch_created = rc == 0
                 if rc != 0:
-                    sys.exit(f"git worktree add не удался: {out.strip()[:300]}")
+                    # гонка: ветку успели создать между проверкой и add — цепляем её
+                    rc_v, _ = sh(["git", "rev-parse", "--verify", "-q", f"refs/heads/{branch}"], cwd=self.repo)
+                    if rc_v == 0:
+                        rc, out = sh(["git", "worktree", "add", str(wt), branch], cwd=self.repo, timeout=300)
+            if rc != 0:
+                sys.exit(f"git worktree add не удался: {out.strip()[:300]}")
+            created = True
             log(self.task_dir, f"создан worktree {wt} (ветка {branch}, база {base[:10]})")
-        # provisioning — при каждом запуске (скрипт идемпотентен); имена ресурсов —
-        # из git.worktree_links конфига (R4)
+        try:
+            self._provision_worktree(wt)
+        except SystemExit:
+            if created:
+                self._rollback_worktree(st, wt, branch, branch_created)
+            raise
+
+    def _provision_worktree(self, wt: Path) -> None:
+        """Provisioning ресурсов + симлинк артефактов в worktree (идемпотентно, каждый запуск).
+        Не удалось — SystemExit (fail-closed); откат только что созданного worktree — на вызывающем."""
+        # имена ресурсов — из git.worktree_links конфига (R4)
         rc, out = sh([sys.executable, str(SCRIPT_DIR / "provision_worktree.py"),
                       str(self.repo), str(wt), *worktree_links_of(self.cfg)], timeout=300)
         if rc != 0:
@@ -3120,12 +3198,24 @@ class Pipeline:
         # симлинк артефактов: <worktree>/pipeline/<task> -> основное дерево
         arts_link = wt / self.cfg["artifacts_dir"] / self.task
         if arts_link.exists() and not arts_link.is_symlink():
-            sys.exit(f"в worktree {wt} путь {self.cfg['artifacts_dir']}/{self.task} — реальный каталог: артефакты "
-                     f"серии закоммичены в базу ветки, а нужен симлинк на каталог артефактов основного дерева. "
-                     f"Используй другое имя серии либо убери этот каталог из коммитов базы")
+            sys.exit(worktree_artifacts_conflict_msg(self.task, self.cfg["artifacts_dir"], []))
         if not arts_link.is_symlink():
             arts_link.parent.mkdir(parents=True, exist_ok=True)
             arts_link.symlink_to(self.task_dir.resolve(), target_is_directory=True)
+
+    def _rollback_worktree(self, st: dict, wt: Path, branch: str, branch_created: bool) -> None:
+        """Откат ТОЛЬКО что созданного (в этом вызове) worktree после сбоя provisioning: иначе остаётся
+        каталог + ветка-сирота + пин базы, и повтор `run` стартует на устаревшей базе (Н3).
+        Ветка удаляется лишь если создана этим же вызовом (наработки прошлых попыток не трогаем)."""
+        sh(["git", "worktree", "remove", "--force", str(wt)], cwd=self.repo, timeout=120)
+        sh(["git", "worktree", "prune"], cwd=self.repo)
+        if branch_created:
+            sh(["git", "branch", "-D", branch], cwd=self.repo)
+            st.pop("worktree_base", None)
+            self.save_state(st)
+        left = " (каталог не удалился — убери вручную)" if wt.exists() else ""
+        log(self.task_dir, f"ОТКАТ создания worktree {wt}: провал provisioning"
+                           f"{', ветка ' + branch + ' удалена, пин базы снят' if branch_created else ''}{left}")
 
     # ---------- режим/изоляция серии и параллельные серии ----------
 
@@ -3572,6 +3662,14 @@ class Pipeline:
                   ignore_claims: bool = False) -> None:
         st = self.load_state()
         self._live_state = st
+        # Н1: задание — нетронутый шаблон/пусто: отказ ДО любых побочных эффектов (worktree, бюджет,
+        # пины). Только для старта планирования/solo — продолжение impl идёт по принятому плану.
+        tfile = self.task_dir / "task.md"
+        if (st.get("phase", "plan") in ("plan", "solo") and tfile.exists()
+                and task_md_is_placeholder(tfile.read_text(encoding="utf-8"))):
+            sys.exit(f"task.md серии {self.task} пуст или остался шаблоном «{TASK_TEMPLATE_MARK}» — "
+                     f"исполнитель спланировал бы пустоту. Напиши задание в {tfile} и повтори run. "
+                     f"Если задание было и пропало — восстанови из git/бэкапа (не из шаблона).")
         if add_budget:
             st["budget_extra_usd"] = round(float(st.get("budget_extra_usd", 0.0) or 0.0) + float(add_budget), 4)
             log(self.task_dir, f"БЮДЖЕТ: добавлено ${add_budget:g} (итого extra ${st['budget_extra_usd']:g})")
@@ -4146,6 +4244,22 @@ def changed_files_all(repo: Path) -> list[str]:
     return [p for _, p in changed_status_all(repo)]
 
 
+def is_foreign_series_artifact(repo: Path, path: str, artifacts_rel: str) -> bool:
+    """Путь — артефакт ДРУГОЙ серии: `<artifacts_dir>/<иная серия>/…`, где у иной серии на диске
+    есть task.md или state.json. Такие файлы ведёт цикл их серии; для commit-by-plan это не
+    «файлы вне групп» (Н5: заранее написанный task.md следующей серии блокировал --yes и
+    подталкивал оператора коммитить его вручную — а закоммиченный task.md worktree-серии ломает её
+    старт, Н2). Общие файлы `<artifacts_dir>/*.md` и каталоги без следов серии — НЕ чужие."""
+    root, _, own = artifacts_rel.rpartition("/")
+    if not root or not path.startswith(root + "/"):
+        return False
+    other = path[len(root) + 1:].split("/", 1)
+    if len(other) < 2 or other[0] == own:
+        return False
+    d = Path(repo) / root / other[0]
+    return (d / "task.md").exists() or (d / "state.json").exists()
+
+
 def collect_commit_groups(repo: Path, task_dir: Path, version: int, artifacts_rel: str,
                           worktree_links: tuple[str, ...] | list[str] = ()) -> dict:
     """Снимок для commit-by-plan (чистая функция для юнитов).
@@ -4162,6 +4276,7 @@ def collect_commit_groups(repo: Path, task_dir: Path, version: int, artifacts_re
         return {
             "groups": [], "warnings": [f"файл отчёта не найден: {report} (укажи --version N)"],
             "uncovered": [], "overlaps": [], "artifacts": [], "changed": [],
+            "foreign_artifacts": [],
         }
     groups, warnings = parse_commit_plan(report.read_text(encoding="utf-8"))
     changed = [p for p in changed_files_all(repo) if not is_provisioned_symlink(repo, p, worktree_links)]
@@ -4170,12 +4285,15 @@ def collect_commit_groups(repo: Path, task_dir: Path, version: int, artifacts_re
     # артефактов/симлинк worktree попадал в coverage), а untracked_list
     # резал строже — семантики двух точек расходились.
     artifacts = [p for p in changed if is_artifact_path(p, artifacts_rel)]
-    scope = [p for p in changed if not is_artifact_path(p, artifacts_rel)]
+    foreign = [p for p in changed if not is_artifact_path(p, artifacts_rel)
+               and is_foreign_series_artifact(repo, p, artifacts_rel)]
+    scope = [p for p in changed if not is_artifact_path(p, artifacts_rel) and p not in foreign]
     uncovered, overlaps = uncovered_files(groups, scope)
     return {
         "groups": groups, "warnings": warnings,
         "uncovered": uncovered, "overlaps": overlaps,
         "artifacts": artifacts, "changed": changed,
+        "foreign_artifacts": foreign,     # Н5: чужие серии — не блокируют и не коммитятся этой командой
     }
 
 
@@ -4435,6 +4553,9 @@ def cmd_commit_by_plan(cfg: dict, args) -> None:
             print(f"  {o}")
     if snap["artifacts"]:
         print(f"артефакты задачи (в coverage не входят, коммитятся отдельно): {snap['artifacts']}")
+    if snap["foreign_artifacts"]:
+        print(f"артефакты ДРУГИХ серий (не блокируют, эта команда их не коммитит — их ведёт цикл своей "
+              f"серии; worktree-серии их коммитить до merge нельзя): {snap['foreign_artifacts']}")
     if not groups:
         print("нечего прогонять: групп нет (см. предупреждения выше)")
         sys.exit(1)
@@ -4443,7 +4564,8 @@ def cmd_commit_by_plan(cfg: dict, args) -> None:
     # collect_commit_groups — прежний bare slash-префикс пропускал запись
     # «?? pipeline/<task>» (симлинк артефактов worktree) в scope cmd-пути,
     # и широкий глоб мог закоммитить его как blob.
-    scope = [x for x in snap["changed"] if not is_artifact_path(x, arts_rel)]
+    scope = [x for x in snap["changed"]
+             if not is_artifact_path(x, arts_rel) and x not in snap["foreign_artifacts"]]
     untracked = {path for xy, path in changed_status_all(p.work_path) if xy == "??"}
 
     if args.dry_run:
@@ -4595,9 +4717,44 @@ def run_detached(cfg: dict, task: str, argv: list[str] | None = None) -> None:
     print(f"лог: tail -f {task_dir / 'orchestrator.log'} | консоль: tail -f {bg_log}")
 
 
+TASK_TEMPLATE_MARK = "Опиши задачу здесь."
+
+
+def task_template(task: str) -> str:
+    return f"# Задача: {task}\n\n{TASK_TEMPLATE_MARK}\n"
+
+
+def task_md_is_placeholder(text: str) -> bool:
+    """task.md — пустой файл либо нетронутый шаблон `init` (заголовок + «Опиши задачу здесь.»).
+    Заголовок без шаблонной строки (`# задача demo`) шаблоном НЕ считается: это осознанно краткое
+    задание. Исполнитель, запущенный на шаблоне, «спланирует пустоту» и сожжёт бюджет."""
+    lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+    if not lines:
+        return True
+    body = [ln for ln in lines if not ln.startswith("#")]
+    return bool(body) and all(ln == TASK_TEMPLATE_MARK for ln in body)
+
+
 def cmd_init(cfg: dict, args) -> None:
     repo = Path(cfg["repo"]).resolve()
     task_dir = repo / cfg["artifacts_dir"] / args.task
+    stf = task_dir / "state.json"
+    pins = resolve_mode_flags(args)
+    # Н2: worktree-серия + каталог артефактов серии, закоммиченный в HEAD, — отказ ДО создания
+    # чего-либо (раньше ловилось на `run` уже после создания worktree и ветки)
+    try:
+        old_iso = load_json(stf).get("isolation") if stf.exists() else None
+    except (OSError, ValueError, AttributeError):
+        old_iso = None          # битый state.json: init его и раньше не читал — не падаем
+    iso = pins.get("isolation") or old_iso or (cfg.get("git") or {}).get("isolation", "shared")
+    if iso == "worktree":
+        tracked = artifacts_tracked_in_ref(repo, "HEAD", f"{cfg['artifacts_dir']}/{args.task}")
+        if tracked:
+            sys.exit(worktree_artifacts_conflict_msg(args.task, cfg["artifacts_dir"], tracked))
+    # Н1: следы серии есть, а task.md пропал (rm -rf, ручная уборка) — шаблон ниже затрёт смысл
+    leftovers = ([c.name for c in task_dir.iterdir() if c.name not in (".lock", "transcripts")]
+                 if task_dir.is_dir() else [])
+    had_task = (task_dir / "task.md").exists()
     task_dir.mkdir(parents=True, exist_ok=True)
     (task_dir / "transcripts").mkdir(exist_ok=True)
     tf = task_dir / "task.md"
@@ -4605,9 +4762,12 @@ def cmd_init(cfg: dict, args) -> None:
         if args.task_file:
             tf.write_text(Path(args.task_file).read_text(encoding="utf-8"), encoding="utf-8")
         else:
-            tf.write_text(f"# Задача: {args.task}\n\nОпиши задачу здесь.\n", encoding="utf-8")
-    stf = task_dir / "state.json"
-    pins = resolve_mode_flags(args)
+            tf.write_text(task_template(args.task), encoding="utf-8")
+            if not had_task and leftovers:
+                print(f"ВНИМАНИЕ: task.md серии {args.task} отсутствовал, хотя в каталоге есть другие файлы "
+                      f"({', '.join(sorted(leftovers)[:5])}). Записан ШАБЛОН — если задание было, "
+                      f"восстанови его из git/бэкапа ДО run (`run` на шаблоне откажет). Чтобы сбросить "
+                      f"серию, сохранив task.md, есть `duo reset --task {args.task}`.", file=sys.stderr)
     if not stf.exists():
         new_state = {
             "task": args.task,
@@ -4805,6 +4965,13 @@ def cmd_status(cfg: dict, args) -> None:
     if info.get("halt"):
         h = info["halt"]
         print(f"остановка: kind={h.get('kind')} phase={h.get('phase')} resumable={h.get('resumable')} — {info['stop_reason']}")
+    tel = [t for t in (st.get("review_telemetry") or []) if isinstance(t, dict)]
+    stubs = sum(int(t.get("stub_retries", 0) or 0) for t in tel)
+    tretry = sum(int(t.get("transport_retries", 0) or 0) for t in tel)
+    empty = sum(int(t.get("empty_retries", 0) or 0) for t in tel)
+    if stubs or tretry or empty:
+        print(f"транспорт ревью (деградации, на вердикт обычно не влияют): ответов-заглушек {stubs}, "
+              f"транспортных повторов {tretry}, пустых ревью {empty} — по {len(tel)} ревью")
 
 
 # коды выхода `wait` (для скриптов помощника и `notify_on_output`-сторожей)
@@ -5294,12 +5461,53 @@ def cmd_claims(cfg: dict, args) -> None:
 
 # ----------------------------------------------------------------------------
 # pipegates: гейты поставки в ЧИСТОЙ копии (CLAUDE.md п.6 «гейты поставки = гейты
-# CI»): git archive REF + опциональные заглушки тяжёлых модулей (gate_stubs/ рядом
-# со скриптом, падают при импорте — как CI-раннер без torch/onnx/…), все шаги — в
+# CI»): git archive REF + опциональные заглушки тяжёлых модулей (каталог gates.stubs
+# проекта, пакеты падают при импорте — как CI-раннер без torch/onnx/…), все шаги — в
 # копии, в рабочее дерево проекта команда не пишет, state.json только читает,
 # .lock не берёт. R3 (duoportable): НАБОР ШАГОВ И ИХ АРГУМЕНТЫ — из конфига
 # (gates.steps; плейсхолдеры {py}/{pybin}/{cpus}); примеры — docs/PROJECT-SETUP.md.
 # ----------------------------------------------------------------------------
+
+
+def gates_dirty_changes(tree: Path, artifacts_dir: str) -> tuple[list[str], list[str]]:
+    """Незакоммиченное состояние дерева для `gates --dirty`/предупреждения: (upsert, delete).
+    Без переименований (--no-renames: R превращается в D+A — копия получает и новый файл, и без
+    старого), без симлинков (provisioning), без всего каталога артефактов `<artifacts_dir>/`
+    (это не код под гейтами; в нём сотни чужих файлов серий)."""
+    rc, out = sh(["git", "status", "--porcelain", "-z", "--untracked-files=all", "--no-renames"], cwd=tree)
+    if rc != 0:
+        return [], []
+    up: list[str] = []
+    dele: list[str] = []
+    for e in (x for x in out.split("\0") if x):
+        if len(e) < 4:
+            continue
+        xy, path = e[:2], e[3:]
+        if is_artifact_path(path, artifacts_dir):
+            continue
+        fp = tree / path
+        if fp.is_symlink():
+            continue
+        if fp.is_file():
+            up.append(path)
+        elif not fp.exists() and "D" in xy:
+            dele.append(path)
+    return up, dele
+
+
+def gates_expand_extra(repo: Path, path: str) -> list[str]:
+    """--extra: файл → [файл]; каталог → его файлы под git (tracked + untracked, не игнорируемые;
+    так `dashboard/` с 37 файлами не нужно перечислять, а node_modules/кэши не уезжают в копию)."""
+    full = repo / path
+    if full.is_file():
+        return [path]
+    if not full.is_dir():
+        sys.exit(f"--extra {path!r}: нет файла/каталога в {repo}")
+    rc, out = sh(["git", "ls-files", "-z", "-c", "-o", "--exclude-standard", "--", path], cwd=repo)
+    files = [f for f in out.split("\0") if f and (repo / f).is_file() and not (repo / f).is_symlink()]
+    if rc != 0 or not files:
+        sys.exit(f"--extra {path!r}: в каталоге нет файлов под git (tracked/untracked, не игнорируемых)")
+    return files
 
 
 def _default_cpus() -> str:
@@ -5420,13 +5628,34 @@ def cmd_gates(cfg: dict, args, runner: Callable | None = None) -> int:
     only = [s for s in names if not args.only or s in args.only.split(",")]
     if args.name and not re.fullmatch(r"[A-Za-z0-9._-]+", args.name):
         sys.exit(f"--name {args.name!r}: допустимы буквы/цифры/._-")
-    extras = []
+    extras: list[str] = []
     for p in args.extra or []:
         if Path(p).is_absolute() or ".." in Path(p).parts:
             sys.exit(f"--extra {p!r}: только относительные пути без '..' от корня {repo}")
-        if not (repo / p).is_file():
-            sys.exit(f"--extra {p!r}: нет файла в {repo}")
-        extras.append(p)
+        for f in gates_expand_extra(repo, p):
+            if f not in extras:
+                extras.append(f)
+
+    # Н4: что архивируем vs что реально лежит в дереве серии. Для shared это основное дерево, для
+    # worktree-серии (ref=ветка) — её worktree. Если ref совпадает с HEAD того дерева, а в нём есть
+    # незакоммиченные правки — копия их НЕ содержит: гейты проверят бейзлайн (в поле: 25 ошибок ruff
+    # «старого кода» при зелёной серии). Не молчим; `--dirty` накладывает правки поверх.
+    rc_r, ref_sha = sh(["git", "rev-parse", f"{ref}^{{commit}}"], cwd=repo)
+    src_tree = repo
+    wt_dir = worktree_path(cfg, repo, args.task)
+    if ref == branch and (wt_dir / ".git").exists():
+        src_tree = wt_dir
+    rc_h, tree_head = sh(["git", "rev-parse", "HEAD"], cwd=src_tree)
+    d_up, d_del = gates_dirty_changes(src_tree, cfg["artifacts_dir"])
+    dirty_n = len(d_up) + len(d_del)
+    overlay = bool(getattr(args, "dirty", False))
+    stale_warn = ""
+    if dirty_n and not overlay and rc_r == 0 and rc_h == 0 and ref_sha.strip() == tree_head.strip():
+        sample = ", ".join((d_up + d_del)[:5]) + (" …" if dirty_n > 5 else "")
+        stale_warn = (f"ВНИМАНИЕ: ref={ref} НЕ содержит {dirty_n} незакоммиченных изменений дерева {src_tree} "
+                      f"({sample}) — гейты проверят БЕЙЗЛАЙН, а не код серии. Добавь --dirty (HEAD + "
+                      f"незакоммиченное), либо --extra <файлы|каталоги>, либо сначала закоммить "
+                      f"(commit-by-plan).")
 
     stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
     base = "gates_" + (f"{args.name}_" if args.name else "") + stamp
@@ -5439,6 +5668,11 @@ def cmd_gates(cfg: dict, args, runner: Callable | None = None) -> int:
     stubs_txt = str(stubs_dir) if stubs_dir is not None else "(off)"
     print(f"gates: task={args.task} ref={ref} copy={copy_dir} stubs={stubs_txt} py={g['py']} "
           f"cpus={g['cpus']} logs={log_dir}")
+    if overlay:
+        print(f"--dirty: поверх {ref} накладываются незакоммиченные правки {src_tree}: "
+              f"изменено/новых {len(d_up)}, удалено {len(d_del)}")
+    if stale_warn:
+        print(stale_warn)
     try:
         if args.dry_run:
             total = len(steps)
@@ -5457,6 +5691,13 @@ def cmd_gates(cfg: dict, args, runner: Callable | None = None) -> int:
             sys.exit(f"git archive {ref!r} не удался: {arch.stderr.decode(errors='replace')[:300]}")
         with tarfile.open(fileobj=io.BytesIO(arch.stdout)) as tar:
             tar.extractall(copy_dir, filter="data")
+        if overlay:
+            for p in d_up:
+                dst = copy_dir / p
+                dst.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(src_tree / p, dst)
+            for p in d_del:
+                (copy_dir / p).unlink(missing_ok=True)
         for p in extras:
             dst = copy_dir / p
             dst.parent.mkdir(parents=True, exist_ok=True)
@@ -5469,7 +5710,11 @@ def cmd_gates(cfg: dict, args, runner: Callable | None = None) -> int:
             with open(summary, "a", encoding="utf-8") as f:
                 f.write(line + "\n")
 
-        note(f"gate {args.name or args.task} ref={ref} files={' '.join(extras)}")
+        note(f"gate {args.name or args.task} ref={ref} files={' '.join(extras[:20])}"
+             f"{' …(+' + str(len(extras) - 20) + ')' if len(extras) > 20 else ''}"
+             f"{f' dirty_overlay=+{len(d_up)}/-{len(d_del)}' if overlay else ''}")
+        if stale_warn:
+            note(f"WARN: ref не содержит {dirty_n} незакоммиченных изменений — проверен бейзлайн, не код серии")
         run = runner or _gates_default_runner
         red = False
         for step in steps:
@@ -5486,6 +5731,9 @@ def cmd_gates(cfg: dict, args, runner: Callable | None = None) -> int:
             red = red or rc != 0
         note("GATE_DONE")
         print(f"{'FAIL' if red else 'OK'}: логи {log_dir} ({'есть красный шаг' if red else 'все шаги зелёные'})")
+        if stale_warn:
+            print(f"⚠ результат относится к ref={ref} БЕЗ {dirty_n} незакоммиченных изменений (см. ВНИМАНИЕ выше): "
+                  f"зелёный гейт здесь не доказывает, что код серии чист")
         return 1 if red else 0
     finally:
         if args.keep:
@@ -5703,6 +5951,15 @@ def main() -> None:
                         "первого коммита (all-or-nothing)")
     p.add_argument("--allow-partial", action="store_true",
                    help="с --yes: не отказывать при аномалиях плана, закоммитить только валидные группы")
+    p = sub.add_parser("reset", help="сброс серии с чистого листа: state/планы/ревью/логи/транскрипты уезжают в "
+                                     "pipeline/<task>/_reset_<метка>/ (не удаляются), task.md СОХРАНЯЕТСЯ; "
+                                     "снимает worktree и ветку duo/<task> (при наработках — отказ без --force)")
+    p.add_argument("--task", required=True)
+    p.add_argument("--dry-run", action="store_true", help="показать, что будет сделано; ничего не менять")
+    p.add_argument("--yes", action="store_true", help="не спрашивать подтверждение (в неинтерактиве без --yes — отказ)")
+    p.add_argument("--force", action="store_true",
+                   help="обойти отказ по наработкам: phase=done, грязный worktree, неслитые коммиты ветки "
+                        "(живую серию — lock занят — не обходит)")
     p = sub.add_parser("merge", help="влить принятую worktree-серию (ветка duo/<task>) в текущую ветку основного дерева")
     p.add_argument("--task", required=True)
     p.add_argument("--dry-run", action="store_true", help="только проверить: что войдёт и будут ли конфликты")
@@ -5719,7 +5976,12 @@ def main() -> None:
     p.add_argument("--name", help="метка прогона (в имя каталога логов и summary)")
     p.add_argument("--only", help="подмножество шагов через запятую (имена из gates.steps конфига)")
     p.add_argument("--extra", nargs="+", metavar="PATH",
-                   help="доп. файлы из основного дерева (незакоммиченное/неслитое), пути от корня repo")
+                   help="доп. файлы или КАТАЛОГИ из основного дерева (незакоммиченное/неслитое), пути от "
+                        "корня repo; каталог — его файлы под git (tracked+untracked, без игнорируемых)")
+    p.add_argument("--dirty", action="store_true",
+                   help="наложить на копию незакоммиченные правки дерева серии (изменённые, новые, удалённые "
+                        "файлы; без каталога артефактов) — иначе для незакоммиченной серии проверяется "
+                        "бейзлайн HEAD (будет ВНИМАНИЕ)")
     p.add_argument("--dry-run", action="store_true", help="только печать плана шагов и команд")
     p.add_argument("--keep", action="store_true", help="не удалять временную копию (для разбора)")
     p = sub.add_parser("archive", help="уборка завершённой серии pipeline/<task>: без снимка "
@@ -5801,6 +6063,11 @@ def main() -> None:
         cmd_hold(cfg, args, False)
     elif args.cmd == "commit-by-plan":
         cmd_commit_by_plan(cfg, args)
+    elif args.cmd == "reset":
+        # логика — в соседнем модуле (как archive): ленивый импорт, см. комментарий ниже
+        sys.path.insert(0, str(SCRIPT_DIR))
+        from reset_cmd import cmd_reset
+        sys.exit(cmd_reset(cfg, args))
     elif args.cmd == "merge":
         sys.exit(cmd_merge(cfg, args))
     elif args.cmd == "claims":

@@ -31,6 +31,7 @@ cd /путь/к/проекту && duo setup   # подключить проек�
 - Управление сериями: [docs/CHEATSHEET-CONTROL.md](docs/CHEATSHEET-CONTROL.md)
 - Подключение проекта и несколько машин: [docs/PROJECT-SETUP.md](docs/PROJECT-SETUP.md)
 - Надзор и отказоустойчивость: [docs/CHEATSHEET-WATCHDOG-FAILSAFE.md](docs/CHEATSHEET-WATCHDOG-FAILSAFE.md)
+- Полевая проверка инструмента на проекте (бриф оператору и контролёру): [docs/FIELD-TEST-BRIEF.md](docs/FIELD-TEST-BRIEF.md)
 - Гейты разработки самого инструмента: `make check`
 
 Состояние: инструмент отлажен на личных стендах автора; настройки под чужую среду (модель,
