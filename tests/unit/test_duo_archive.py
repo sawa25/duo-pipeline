@@ -562,6 +562,24 @@ def test_guard_sets_builtin_plus_config():
     assert arc._refs_pattern(["x1", "x 2"]).pattern == r"pipeline/(x1|x\ 2)(/|\b)"
 
 
+def test_guard_contract_literals_pinned_for_vca_counterpart():
+    """Контракт охраны архива — ДВУСТОРОННИЙ пин. Охранный тест проекта (vca:
+    tests/arch/test_archived_series_refs.py) и его проверка соответствия конфигу
+    (tests/arch/test_archive_guard_config_sync.py в vca) держат ТЕ ЖЕ литералы. CI проекта не
+    исполняет код инструмента, а CI инструмента (make check) не видит тест проекта, поэтому
+    сверка идёт через общие литералы: изменили здесь — поправьте vca-тест, и наоборот."""
+    assert arc.GUARD_SKIP_DIRS_BUILTIN == {
+        ".git", ".worktrees", "node_modules", "dist", "build", "__pycache__",
+        ".ruff_cache", ".mypy_cache", ".pytest_cache", ".venv", "venv",
+    }
+    assert arc.GUARD_BINARY_SUFFIXES == {
+        ".png", ".jpg", ".jpeg", ".gif", ".pdf", ".bin", ".zst", ".zip", ".tar",
+        ".gz", ".ico", ".woff", ".woff2", ".mp4", ".onnx", ".gguf",
+    }
+    assert arc.GUARD_ENV_FILENAMES == {".env"}
+    assert arc._is_local_env(".env.bak_20261101") and not arc._is_local_env(".env.example")
+
+
 def test_merge_target_refs_builtin_plus_config(tmp_path: Path):
     """Ветки слияния: нейтральный builtin (HEAD, main) ∪ archive.merge_target_refs проекта;
     vca-ветка dev/speedlim в коде больше не живёт. merged_into учитывает переданный набор."""
