@@ -72,6 +72,11 @@ if (( DO_SYSTEMD )); then
         systemctl --user enable --now duo-supervise.timer
         systemctl --user list-timers 'duo-supervise*' --no-pager
         say "OK. Проверка: journalctl --user -u duo-supervise.service -n 5 --no-pager"
+        if [[ "$(loginctl show-user "$USER" -p Linger --value 2>/dev/null || true)" != "yes" ]]; then
+            say "ВНИМАНИЕ: Linger=no — user-таймер остановится при выходе из последней сессии (ssh) и не"
+            say "         запустится после перезагрузки до первого входа. Включить (один раз, нужен sudo):"
+            say "         sudo loginctl enable-linger $USER"
+        fi
     fi
 fi
 

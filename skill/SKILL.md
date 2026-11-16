@@ -63,7 +63,8 @@ duo merge --task NAME --dry-run && duo merge --task NAME --yes   # только 
 Остановки (`needs_human`): `duo run --task NAME --resume [--add-budget USD] [--add-iterations N]`
 для машинных halt; решение эксперта — `duo set-verdict --task NAME --verdict ACCEPT|REVISE --note "…"`
 или `duo rework --task NAME --phase plan|impl --review FILE --run`.
-Все проекты и надзор: `duo projects`; тик надзора `duo supervise` (systemd-таймер по всем проектам).
+Все проекты и надзор: `duo projects`; тик надзора `duo supervise` (systemd-таймер по всем проектам; он сам
+возобновляет «мёртвые» серии за счёт бюджета — перед включением на машине см. `$DUO_HOME/docs/CHEATSHEET-WATCHDOG-FAILSAFE.md`).
 
 ## CI и гейты: три контура, не путать
 
