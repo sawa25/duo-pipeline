@@ -4521,6 +4521,41 @@ def cmd_hold(cfg: dict, args, hold: bool) -> None:
         print(f"(phase={phase}: hold_impl влияет только на автопродолжение impl_pending)")
 
 
+def staged_paths(work: Path) -> list[str]:
+    """Что уже лежит в индексе дерева (git diff --cached): commit-by-plan такой staging не трогает."""
+    rc, out = sh(["git", "diff", "--cached", "--name-only"], cwd=work)
+    return [x for x in out.splitlines() if x.strip()] if rc == 0 else []
+
+
+def print_staged_warning(work: Path, staged: list[str]) -> None:
+    print("ВНИМАНИЕ: индекс уже содержит застейдженные файлы (чужой staging) — не вмешиваюсь:")
+    print("\n".join(staged))
+    # Н9 полевой проверки: самый частый источник — собственный `git add -A` оператора перед гейтами
+    # (для гейтов индекс не нужен: `duo gates --dirty`). Файлы не пострадают — сбрасывается только индекс.
+    print(f"Если это случайный `git add` — сними индекс (правки в файлах сохранятся): git -C {work} reset")
+
+
+def commit_yes_problems(snap: dict, groups: list[dict], scope: list[str], arts_rel: str,
+                        warnings: list[str]) -> list[str]:
+    """Аномалии, при которых `--yes` откажет до первого коммита (all-or-nothing). Один источник
+    правды для preflight `--yes` и для предсказания в `--dry-run` (Н12: dry-run раньше молчал о
+    части отказов и «обещал» зелёное)."""
+    # devhyg: группа из одних артефактных глобов — не «пустая» ошибка (артефакты
+    # серии коммитятся отдельно); обычная пустая — отказ.
+    empties = [g["name"] for g in groups
+               if not artifact_only_group(g, arts_rel) and not group_changed_files(g, scope)]
+    problems: list[str] = []
+    if warnings:
+        problems.append(f"предупреждения парсера таблицы: {len(warnings)}")
+    if snap["uncovered"]:
+        problems.append(f"файлов вне групп (uncovered): {len(snap['uncovered'])}")
+    if snap["overlaps"]:
+        problems.append(f"файлов в нескольких группах (overlap): {len(snap['overlaps'])}")
+    if empties:
+        problems.append(f"групп без изменённых файлов: {len(empties)} ({', '.join(empties)})")
+    return problems
+
+
 def cmd_commit_by_plan(cfg: dict, args) -> None:
     """Интерактивный прогон коммит-групп из ## commit_plan (pipev2).
 
@@ -4578,32 +4613,28 @@ def cmd_commit_by_plan(cfg: dict, args) -> None:
             if not files:
                 print("    (артефакты серии — коммитятся отдельно)" if artifact_only_group(g, arts_rel)
                       else "    (нет изменённых файлов под глобами группы)")
+        staged = staged_paths(p.work_path)
+        if staged:
+            print()
+            print_staged_warning(p.work_path, staged)
+        predicted = commit_yes_problems(snap, groups, scope, arts_rel, warnings)
+        if staged:
+            predicted.insert(0, f"индекс уже содержит застейдженные файлы: {len(staged)}")
         print("\n--dry-run: коммитов нет")
-        sys.exit(1 if (snap["uncovered"] or snap["overlaps"] or warnings) else 0)
+        print("предсказание для `--yes`: ОТКАЖЕТ — " + "; ".join(predicted) if predicted
+              else "предсказание для `--yes`: пройдёт (аномалий плана и чужого staging нет)")
+        sys.exit(1 if predicted else 0)
 
-    rc, staged = sh(["git", "diff", "--cached", "--name-only"], cwd=p.work_path)
-    if rc == 0 and staged.strip():
-        print("ВНИМАНИЕ: индекс уже содержит застейдженные файлы (чужой staging) — не вмешиваюсь:")
-        print(staged.strip())
+    staged = staged_paths(p.work_path)
+    if staged:
+        print_staged_warning(p.work_path, staged)
         sys.exit(1)
 
     # preflight «всё или ничего» для --yes (грабли 8, 29.10.2026): без интерактива некому остановить
     # кривую таблицу — серия получила один «docs»-коммит вместо шести. Любая аномалия плана →
     # отказ ДО первого коммита; осознанный частичный прогон — `--allow-partial`.
     if yes_all and not getattr(args, "allow_partial", False):
-        # devhyg: группа из одних артефактных глобов — не «пустая» ошибка (артефакты
-        # серии коммитятся отдельно); обычная пустая — как раньше, отказ.
-        empties = [g["name"] for g in groups
-                   if not artifact_only_group(g, arts_rel) and not group_changed_files(g, scope)]
-        problems = []
-        if warnings:
-            problems.append(f"предупреждения парсера таблицы: {len(warnings)}")
-        if snap["uncovered"]:
-            problems.append(f"файлов вне групп (uncovered): {len(snap['uncovered'])}")
-        if snap["overlaps"]:
-            problems.append(f"файлов в нескольких группах (overlap): {len(snap['overlaps'])}")
-        if empties:
-            problems.append(f"групп без изменённых файлов: {len(empties)} ({', '.join(empties)})")
+        problems = commit_yes_problems(snap, groups, scope, arts_rel, warnings)
         if problems:
             print("ОТКАЗ --yes: " + "; ".join(problems) + ". Ни один коммит не сделан.")
             print("Исправь `## commit_plan` в impl_report (или закоммить вручную), либо повтори с "
@@ -4751,6 +4782,12 @@ def cmd_init(cfg: dict, args) -> None:
         tracked = artifacts_tracked_in_ref(repo, "HEAD", f"{cfg['artifacts_dir']}/{args.task}")
         if tracked:
             sys.exit(worktree_artifacts_conflict_msg(args.task, cfg["artifacts_dir"], tracked))
+    if not stf.exists() and python_junk_unignored(repo):
+        print("ВНИМАНИЕ: Python-проект, а .gitignore не покрывает `__pycache__/` — .pyc от прогона тестов "
+              "исполнителем вылезут как «вне files_touch» (предупреждение ревьюеру) и как uncovered в "
+              "`commit-by-plan --yes` (блокирует). Добавь `__pycache__/` в .gitignore и закоммить ДО "
+              "серии (для worktree-серии — обязательно до `run`: база берётся из HEAD); `duo setup` "
+              "делает это сам.", file=sys.stderr)
     # Н1: следы серии есть, а task.md пропал (rm -rf, ручная уборка) — шаблон ниже затрёт смысл
     leftovers = ([c.name for c in task_dir.iterdir() if c.name not in (".lock", "transcripts")]
                  if task_dir.is_dir() else [])
@@ -4936,6 +4973,33 @@ def format_status_table(rows: list[dict]) -> str:
     return "\n".join(lines)
 
 
+def accepted_plan_summary(st: dict) -> str | None:
+    """Сводка «что принято» для момента решения о запуске имплементации (Н11 полевой проверки):
+    версия плана, ревью-приёмка, эрраты, зона записи, потрачено. Только уже имеющиеся поля state —
+    ничего не вычисляет заново (число эррат — `errata_applied.items`, его пишет оркестратор при дописывании).
+    None — плана ещё нет."""
+    pv = int(st.get("plan_version", 0) or 0)
+    if pv <= 0:
+        return None
+    rev = next((v.get("rev") for v in reversed(st.get("verdicts") or [])
+                if isinstance(v, dict) and v.get("phase") == "plan" and v.get("verdict") == "ACCEPT"), None)
+    parts = [f"план v{pv} принят" + (f" ревью {rev}" if rev else " (вердикт ACCEPT в state не найден)")]
+    er = st.get("errata_applied")
+    if isinstance(er, dict) and er.get("plan") == f"plan_v{pv}.md":
+        parts.append(f"эрраты: {er.get('items', '?')} п. из {er.get('rev', '?')} дописаны в план")
+    else:
+        parts.append("эрраты оркестратором не дописывались")
+    claim = st.get("claim")
+    if isinstance(claim, dict):
+        if claim.get("declared"):
+            paths = [str(x) for x in (claim.get("paths") or [])]
+            parts.append(f"зона записи: {len(paths)} путей ({', '.join(paths[:6])}{' …' if len(paths) > 6 else ''})")
+        else:
+            parts.append("зона записи НЕ заявлена планом")
+    parts.append(f"потрачено ${float(st.get('spent_usd', 0) or 0):.2f}")
+    return "; ".join(parts)
+
+
 def cmd_status(cfg: dict, args) -> None:
     if getattr(args, "all", False):
         # precedence: --all выигрывает, --task игнорируется
@@ -4965,6 +5029,12 @@ def cmd_status(cfg: dict, args) -> None:
     if info.get("halt"):
         h = info["halt"]
         print(f"остановка: kind={h.get('kind')} phase={h.get('phase')} resumable={h.get('resumable')} — {info['stop_reason']}")
+    summ = accepted_plan_summary(st)
+    if summ and st.get("phase") in ("impl_pending", "impl", "done"):
+        print(f"принято: {summ}")
+        if st.get("phase") == "impl_pending":
+            print(f"решение за человеком: прочти plan_v{st.get('plan_version')}.md и эрраты, затем "
+                  f"`duo run --task {args.task} --continue`")
     tel = [t for t in (st.get("review_telemetry") or []) if isinstance(t, dict)]
     stubs = sum(int(t.get("stub_retries", 0) or 0) for t in tel)
     tretry = sum(int(t.get("transport_retries", 0) or 0) for t in tel)
@@ -5630,8 +5700,15 @@ def cmd_gates(cfg: dict, args, runner: Callable | None = None) -> int:
         sys.exit(f"--name {args.name!r}: допустимы буквы/цифры/._-")
     extras: list[str] = []
     for p in args.extra or []:
-        if Path(p).is_absolute() or ".." in Path(p).parts:
-            sys.exit(f"--extra {p!r}: только относительные пути без '..' от корня {repo}")
+        if Path(p).is_absolute():
+            # абсолютный путь ВНУТРИ корня проекта — нормализуем к относительному (Н8: бриф говорил
+            # «каталог проекта», оператор передал абсолютный); вне корня — отказ
+            try:
+                p = str(Path(os.path.normpath(p)).relative_to(repo))
+            except ValueError:
+                sys.exit(f"--extra {p!r}: абсолютный путь вне корня проекта {repo}")
+        if ".." in Path(p).parts:
+            sys.exit(f"--extra {p!r}: пути без '..', от корня {repo} (абсолютные — только внутри корня)")
         for f in gates_expand_extra(repo, p):
             if f not in extras:
                 extras.append(f)
@@ -5763,6 +5840,24 @@ def cmd_selftest(cfg: dict, args) -> None:
 
 
 GITIGNORE_MARKER = "# duo-pipeline: рантайм серий (duo setup)"
+GITIGNORE_PY_MARKER = "# duo-pipeline: Python-мусор прогонов (duo setup)"
+PY_JUNK_ENTRIES = ["__pycache__/", "*.py[cod]"]
+
+
+def python_junk_unignored(root: Path) -> bool:
+    """Python-проект (под git есть *.py), а `__pycache__` не игнорируется: .pyc от прогона тестов
+    исполнителем вылезут и как «выход за files_touch» (предупреждение ревьюеру), и как uncovered в
+    `commit-by-plan --yes` (all-or-nothing). Н10 полевой проверки. Проверяем вложенный путь
+    (корневой шаблон `/__pycache__/` его не покрывает). .pytest_cache/.ruff_cache/.mypy_cache
+    себя игнорируют сами (внутри свой .gitignore) — в проверку не входят."""
+    rc, out = sh(["git", "ls-files", "-co", "--exclude-standard", "--", "*.py"], cwd=root)
+    if rc != 0 or not out.strip():
+        return False
+    for probe in ("__pycache__/x.pyc", "tests/__pycache__/x.pyc"):
+        rc, _ = sh(["git", "check-ignore", "-q", "--", probe], cwd=root)
+        if rc != 0:
+            return True
+    return False
 
 
 def cmd_setup(cfg: dict, args, repo: Path | None) -> None:
@@ -5837,6 +5932,16 @@ def cmd_setup(cfg: dict, args, repo: Path | None) -> None:
             out_lines += [GITIGNORE_MARKER, *missing]
         gi.write_text("\n".join(out_lines) + "\n", encoding="utf-8")
         done.append(f".gitignore: добавлены {missing} (маркер «{GITIGNORE_MARKER}»)")
+    # Python-мусор прогонов: для Python-проекта без игнора __pycache__ (Н10) — отдельным блоком
+    if python_junk_unignored(root):
+        lines = gi.read_text(encoding="utf-8").splitlines() if gi.exists() else []
+        out_lines = list(lines)
+        if out_lines and out_lines[-1].strip():
+            out_lines.append("")
+        out_lines += [GITIGNORE_PY_MARKER, *PY_JUNK_ENTRIES]
+        gi.write_text("\n".join(out_lines) + "\n", encoding="utf-8")
+        done.append(f".gitignore: Python-проект — добавлены {PY_JUNK_ENTRIES} (маркер «{GITIGNORE_PY_MARKER}»); "
+                    f"без них .pyc от прогона тестов блокируют commit-by-plan --yes")
     # реестр надзора
     if not args.no_register:
         projects = load_projects()
@@ -6043,6 +6148,17 @@ def main() -> None:
         cmd_errata(cfg, args)
     elif args.cmd == "run":
         pins = resolve_mode_flags(args)    # противоречивые флаги — отказ в родителе, не в detached-ребёнке
+        if args.force_continue:
+            # Н11: сводка «что принято» — в выводе самой команды, а не только в state.json (detached-
+            # ребёнок пишет в файл; родитель до этого молчал про то, ЧТО именно запускается)
+            try:
+                st0 = load_json(Path(cfg["repo"]).resolve() / cfg["artifacts_dir"] / args.task / "state.json")
+            except (OSError, ValueError):
+                st0 = {}
+            if st0.get("phase") == "impl_pending":
+                summ = accepted_plan_summary(st0)
+                if summ:
+                    print(f"запуск имплементации: {summ}")
         if not args.fg:
             run_detached(cfg, args.task)   # pipev1 П1: detached по умолчанию
             return

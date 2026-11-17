@@ -54,6 +54,7 @@ duo run --task NAME --continue                  # стадия «код»
 duo wait --task NAME --timeout 7200 --quiet
 duo gates --task NAME [--dirty]                 # гейты в чистой копии (если настроены gates.steps);
                                                 # серия не закоммичена → без --dirty проверится бейзлайн HEAD (будет ВНИМАНИЕ)
+duo commit-by-plan --task NAME --dry-run        # read-only: «предсказание для --yes: пройдёт/ОТКАЖЕТ — причины»
 duo commit-by-plan --task NAME --yes            # разложить коммиты по ## commit_plan отчёта
 duo merge --task NAME --dry-run && duo merge --task NAME --yes   # только worktree-серии
 ```
@@ -64,6 +65,8 @@ duo merge --task NAME --dry-run && duo merge --task NAME --yes   # только 
 Чистый лист для серии, отказавшей на старте: `duo reset --task NAME --dry-run`, затем `--yes` (всё, кроме `task.md`,
 переезжает в `_reset_<метка>/`; worktree и ветка снимаются, наработки защищены). **Никогда `rm -rf pipeline/NAME` и
 правка `state.json`.** Worktree-серии: `pipeline/NAME/` (в т.ч. `task.md`) не коммитить до `merge`.
+**Не `git add` в дереве серии до `commit-by-plan`** (для гейтов — `duo gates --dirty`); перед `--yes` — `--dry-run`.
+Python-проект: `__pycache__/` должен быть в `.gitignore` и закоммичен ДО серии (`duo setup` это делает).
 Остановки (`needs_human`): `duo run --task NAME --resume [--add-budget USD] [--add-iterations N]`
 для машинных halt; решение эксперта — `duo set-verdict --task NAME --verdict ACCEPT|REVISE --note "…"`
 или `duo rework --task NAME --phase plan|impl --review FILE --run`.
