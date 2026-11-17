@@ -32,7 +32,8 @@ duo_pipeline.py — оркестратор пайплайна «исполнит
                                               (ветка duo/NAME) в текущую ветку; конфликты видны до касания дерева
   claims      [--task NAME [--drop]]           зоны записи работающих worktree-серий; --drop отпускает зону брошенной
   review      --task NAME --artifact PATH      разовое дуо-ревью артефакта (пилот/ручной режим)
-  status      --task NAME | --all              состояние задачи / сводная таблица всех задач (+ процесс: lock/liveness)
+  status      --task NAME [--json] | --all     состояние задачи / сводная таблица всех задач (+ процесс: lock/liveness);
+                                              --json — ровно один JSON-объект без прозы (для скриптов оператора)
   wait        --task NAME [--timeout S] [--quiet]   блокирующее ожидание остановки/приёмки; последняя строка
                                               `WAIT-RESULT: done|impl_pending|halted|dead|idle|timeout`, код выхода
                                               0/0/10/11/12/13 — замена самодельным bash-сторожам помощника
@@ -2453,7 +2454,7 @@ class Executor:
 {('Окружение: ' + env_hint) if env_hint else ''}
 Не меняй файлы пайплайна вне своей задачи; не трогай `.env` и секреты.
 Отвечай по-русски, кратко (≤ 20 строк): что сделал, что идёт фоном, что дальше.
-"""
+""" + self._wt_block()
         if self.state.get("mode") == "pair":
             head = ("Ты — исполнитель в автоматизированном пайплайне «исполнитель ↔ проверяющий».\n"
                     "Твоя работа проходит ревью одного независимого проверяющего; его отчёты тебе будут передаваться.\n")
@@ -2477,9 +2478,19 @@ class Executor:
             return ""
         branch = f"{(self.cfg.get('git') or {}).get('branch_prefix', 'duo/')}{self.state.get('task', '')}"
         note = str(self.cfg.get("executor_worktree_note") or "").strip()
+        arts_task = (self.state.get("artifacts_rel")
+                     or f"{self.cfg.get('artifacts_dir', 'pipeline')}/{self.state.get('task', '')}")
         return (f"Изоляция: ты работаешь в отдельном git-worktree `{self.repo}` (ветка `{branch}`); параллельно "
                 "могут идти другие серии в своих worktree. Правь файлы только в этом дереве: основное дерево и "
-                f"чужие worktree не трогай{', ' + note if note else '.'}\n")
+                f"чужие worktree не трогай{', ' + note if note else '.'}\n"
+                # Н13 (полевой прогон 17.11.2026): исполнитель положил скрипт симуляции в каталог
+                # артефактов, запустил из worktree, а `Path(__file__).resolve()` провёл через симлинк
+                # в ОСНОВНОЕ дерево (старый код) — потерян ход модели
+                f"Каталог `{arts_task}` в этом дереве — симлинк на артефакты серии в основном дереве. "
+                "Скрипты, которые ты кладёшь туда и запускаешь, не должны определять корень проекта через "
+                "`Path(__file__).resolve()` или `os.path.realpath`: путь уведёт в основное дерево со старым "
+                "кодом. Бери корень от текущего каталога (запускай из корня worktree) или "
+                "`Path(__file__).absolute()` без resolve.\n")
 
     def _long_run_block(self, task_text: str) -> str:
         """Правила длинных прогонов на стенде (EXECUTOR_LONG_RUN_RULES): только если задание о стенде/ssh."""
@@ -5010,35 +5021,56 @@ def cmd_status(cfg: dict, args) -> None:
         sys.exit("укажи --task NAME или --all")
     p = Pipeline(cfg, args.task)
     st = p.load_state()
-    print(json.dumps(st, ensure_ascii=False, indent=2))
     extra = float(st.get("budget_extra_usd", 0.0) or 0.0)
-    print(f"бюджет: ${st.get('spent_usd', 0):.2f} / ${cfg['limits']['budget_usd'] + extra:g}"
-          + (f" (в т.ч. добавка серии ${extra:g})" if extra else ""))
-    wt_note = (f", дерево {p.work_path}, ветка {cfg['git']['branch_prefix']}{args.task}"
-               if p.isolation == "worktree" else "")
-    print(f"режим: {st.get('mode') or '— (не записан; будет duo)'}, изоляция: {p.isolation}{wt_note}")
+    limit = cfg["limits"]["budget_usd"] + extra
     claim = st.get("claim")
-    if isinstance(claim, dict):
-        state_txt = "отпущена" if claim_released(cfg, p.repo, args.task, st) else "держит"
-        print(f"зона записи: {state_txt}, заявлено путей: {len(claim.get('paths') or [])}"
-              f"{'' if claim.get('declared') else ' (зона не заявлена планом)'}")
+    claim_released_now = claim_released(cfg, p.repo, args.task, st) if isinstance(claim, dict) else None
     info = classify_task(p.task_dir, stale_sec=sup_cfg(cfg)["stale_sec"],
                          dead_max_age_sec=sup_cfg(cfg)["dead_max_age_sec"])
+    summ = accepted_plan_summary(st)
+    tel = [t for t in (st.get("review_telemetry") or []) if isinstance(t, dict)]
+    stubs = sum(int(t.get("stub_retries", 0) or 0) for t in tel)
+    tretry = sum(int(t.get("transport_retries", 0) or 0) for t in tel)
+    empty = sum(int(t.get("empty_retries", 0) or 0) for t in tel)
+    wt = p.isolation == "worktree"
+    if getattr(args, "json", False):
+        # машинный вывод для скриптов оператора: РОВНО один JSON-объект, без прозы (полевой прогон
+        # 17.11.2026: `json.load` обычного вывода падал на «Extra data» — JSON состояния + текст)
+        print(json.dumps({
+            "task": args.task, "phase": st.get("phase"), "mode": st.get("mode"), "isolation": p.isolation,
+            "worktree": str(p.work_path) if wt else None,
+            "branch": f"{cfg['git']['branch_prefix']}{args.task}" if wt else None,
+            "budget": {"spent_usd": round(float(st.get("spent_usd", 0) or 0), 4),
+                       "limit_usd": limit, "extra_usd": extra},
+            "claim": ({"released": claim_released_now, "paths": len(claim.get("paths") or []),
+                       "declared": bool(claim.get("declared"))} if isinstance(claim, dict) else None),
+            "process": {"kind": info["kind"], "alive": bool(info["alive"]), "age_sec": info.get("age_sec")},
+            "halt": info.get("halt") or None, "stop_reason": info.get("stop_reason") or None,
+            "accepted_plan": summ if st.get("phase") in ("impl_pending", "impl", "done") else None,
+            "review_transport": {"stub_retries": stubs, "transport_retries": tretry,
+                                 "empty_retries": empty, "reviews": len(tel)},
+            "state": st,
+        }, ensure_ascii=False, indent=2, default=str))
+        return
+    print(json.dumps(st, ensure_ascii=False, indent=2))
+    print(f"бюджет: ${st.get('spent_usd', 0):.2f} / ${limit:g}"
+          + (f" (в т.ч. добавка серии ${extra:g})" if extra else ""))
+    wt_note = (f", дерево {p.work_path}, ветка {cfg['git']['branch_prefix']}{args.task}" if wt else "")
+    print(f"режим: {st.get('mode') or '— (не записан; будет duo)'}, изоляция: {p.isolation}{wt_note}")
+    if isinstance(claim, dict):
+        state_txt = "отпущена" if claim_released_now else "держит"
+        print(f"зона записи: {state_txt}, заявлено путей: {len(claim.get('paths') or [])}"
+              f"{'' if claim.get('declared') else ' (зона не заявлена планом)'}")
     print(f"процесс: {info['kind']} (lock {'занят' if info['alive'] else 'свободен'}, "
           f"state обновлён {info.get('age_sec', 0)} с назад)")
     if info.get("halt"):
         h = info["halt"]
         print(f"остановка: kind={h.get('kind')} phase={h.get('phase')} resumable={h.get('resumable')} — {info['stop_reason']}")
-    summ = accepted_plan_summary(st)
     if summ and st.get("phase") in ("impl_pending", "impl", "done"):
         print(f"принято: {summ}")
         if st.get("phase") == "impl_pending":
             print(f"решение за человеком: прочти plan_v{st.get('plan_version')}.md и эрраты, затем "
                   f"`duo run --task {args.task} --continue`")
-    tel = [t for t in (st.get("review_telemetry") or []) if isinstance(t, dict)]
-    stubs = sum(int(t.get("stub_retries", 0) or 0) for t in tel)
-    tretry = sum(int(t.get("transport_retries", 0) or 0) for t in tel)
-    empty = sum(int(t.get("empty_retries", 0) or 0) for t in tel)
     if stubs or tretry or empty:
         print(f"транспорт ревью (деградации, на вердикт обычно не влияют): ответов-заглушек {stubs}, "
               f"транспортных повторов {tretry}, пустых ревью {empty} — по {len(tel)} ревью")
@@ -5724,11 +5756,16 @@ def cmd_gates(cfg: dict, args, runner: Callable | None = None) -> int:
         src_tree = wt_dir
     rc_h, tree_head = sh(["git", "rev-parse", "HEAD"], cwd=src_tree)
     d_up, d_del = gates_dirty_changes(src_tree, cfg["artifacts_dir"])
-    dirty_n = len(d_up) + len(d_del)
+    # файлы, которые `--extra` и так накладывает на копию, к «незакоммиченному, чего копия не содержит»
+    # не относятся (иначе предупреждение держится после ровно той правки, которую оно же советует).
+    # `--extra` берёт файлы из ОСНОВНОГО дерева: у worktree-серии это не её дерево — там не засчитываем
+    covered = set(extras) if src_tree == repo else set()
+    d_left = [f for f in d_up if f not in covered]
+    dirty_n = len(d_left) + len(d_del)
     overlay = bool(getattr(args, "dirty", False))
     stale_warn = ""
     if dirty_n and not overlay and rc_r == 0 and rc_h == 0 and ref_sha.strip() == tree_head.strip():
-        sample = ", ".join((d_up + d_del)[:5]) + (" …" if dirty_n > 5 else "")
+        sample = ", ".join((d_left + d_del)[:5]) + (" …" if dirty_n > 5 else "")
         stale_warn = (f"ВНИМАНИЕ: ref={ref} НЕ содержит {dirty_n} незакоммиченных изменений дерева {src_tree} "
                       f"({sample}) — гейты проверят БЕЙЗЛАЙН, а не код серии. Добавь --dirty (HEAD + "
                       f"незакоммиченное), либо --extra <файлы|каталоги>, либо сначала закоммить "
@@ -6007,6 +6044,8 @@ def main() -> None:
                    help="pipework3: добавить N итераций фазе, остановленной по лимиту (state.iter_extra)")
     p = sub.add_parser("status"); p.add_argument("--task")
     p.add_argument("--all", action="store_true", help="сводка по всем задачам")
+    p.add_argument("--json", action="store_true",
+                   help="с --task: ровно один JSON-объект (состояние + производные поля), без текстовых строк")
     p = sub.add_parser("wait", help="блокирующее ожидание остановки/приёмки серии; код выхода см. WAIT_EXIT")
     p.add_argument("--task", required=True)
     p.add_argument("--poll", type=float, default=15.0, help="период опроса, с")

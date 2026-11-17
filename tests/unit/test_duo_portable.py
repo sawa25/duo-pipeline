@@ -253,14 +253,15 @@ WT_BLOCK_WITH_NOTE = (
 def test_executor_worktree_note_byte_exact():
     base = {"repo": "/tmp/x", "git": {"branch_prefix": "duo/"}}
     assert _fake_executor(dict(base), {"isolation": "shared"})._wt_block() == ""   # shared — пусто
-    assert _fake_executor(dict(base), {"isolation": "worktree", "task": "demo"})._wt_block().endswith(
-        "чужие worktree не трогай.\n")                                             # без заметки — прежний хвост
+    assert "чужие worktree не трогай.\n" in _fake_executor(
+        dict(base), {"isolation": "worktree", "task": "demo"})._wt_block()          # без заметки — прежняя 1-я строка
     p = _fake_executor({**base, "executor_worktree_note": "Сервис :8080 не перезапускай."},
                        {"isolation": "worktree", "task": "demo"})
-    assert p._wt_block() == WT_BLOCK_WITH_NOTE   # приписка из конфига дописывается к блоку байт-в-байт
+    # приписка из конфига дописывается к 1-й строке блока байт-в-байт (2-я строка — подсказка про симлинк, Н13)
+    assert p._wt_block().startswith(WT_BLOCK_WITH_NOTE)
     q = _fake_executor({**base, "executor_worktree_note": "  Свои услуги лежат в systemd.  "},
                        {"isolation": "worktree", "task": "demo"})
-    assert q._wt_block().endswith("чужие worktree не трогай, Свои услуги лежат в systemd.\n")
+    assert "чужие worktree не трогай, Свои услуги лежат в systemd.\n" in q._wt_block()
 
 
 def test_no_project_pins_in_sources():

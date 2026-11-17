@@ -62,6 +62,8 @@ duo merge --task NAME --dry-run && duo merge --task NAME --yes   # только 
 `solo`: `duo init --task NAME`, затем `duo run --task NAME --solo` (план и ревью пропускаются;
 итог — `solo_report.md`).
 Состояние: `duo status --task NAME` / `duo status --all`; логи — `pipeline/NAME/orchestrator.log`.
+Для скриптов — `duo status --task NAME --json` (ровно один JSON-объект); обычный вывод `--task` — JSON и текст подряд,
+`json.load` на нём падает.
 Чистый лист для серии, отказавшей на старте: `duo reset --task NAME --dry-run`, затем `--yes` (всё, кроме `task.md`,
 переезжает в `_reset_<метка>/`; worktree и ветка снимаются, наработки защищены). **Никогда `rm -rf pipeline/NAME` и
 правка `state.json`.** Worktree-серии: `pipeline/NAME/` (в т.ч. `task.md`) не коммитить до `merge`.
