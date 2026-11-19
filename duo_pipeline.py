@@ -477,6 +477,11 @@ def _remove_path(p: Path) -> None:
 # Транспорт: claude CLI через профиль claude-glm (Z.AI, glm-5.3)
 # ----------------------------------------------------------------------------
 
+# транспорт claude: период опроса очереди и интервал пульса при молчании модели (секунды; тесты подменяют)
+TRANSPORT_POLL_SEC = 15.0
+TRANSPORT_HEARTBEAT_SEC = 120.0
+
+
 class ClaudeGlm:
     def __init__(self, cfg: dict):
         self.cfg = cfg
@@ -565,17 +570,25 @@ class ClaudeGlm:
         cost = 0.0
         got_result = False
         last_activity = time.time()
+        next_beat = last_activity + TRANSPORT_HEARTBEAT_SEC
         idle_killed = False
         while True:
             try:
-                line = out_q.get(timeout=15)
+                line = out_q.get(timeout=TRANSPORT_POLL_SEC)
             except queue.Empty:
                 if proc.poll() is not None:
                     break
-                if time.time() - last_activity > idle_limit:
+                now = time.time()
+                if now - last_activity > idle_limit:
                     idle_killed = True
                     proc.kill()
                     break
+                if now >= next_beat:
+                    # Н24: молчащий вызов (модель «думает» до минут) выглядел в консоли и в `status` как
+                    # зависший оркестратор; пульс показывает, что процесс жив, и сколько до отсечки
+                    print(f"    … жду ответ модели: тишина {int(now - last_activity)} с "
+                          f"(отсечка по тишине {idle_limit} с)", flush=True)
+                    next_beat = now + TRANSPORT_HEARTBEAT_SEC
                 continue
             if line is None:
                 break
@@ -583,6 +596,7 @@ class ClaudeGlm:
             if not line:
                 continue
             last_activity = time.time()
+            next_beat = last_activity + TRANSPORT_HEARTBEAT_SEC
             try:
                 ev = json.loads(line)
             except json.JSONDecodeError:
@@ -2929,8 +2943,12 @@ class Pipeline:
         try:
             fcntl.flock(self._lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
+            # Н21 (полевой разбор 19.11.2026): повторный `run --continue` через пару секунд получал этот
+            # отказ и выглядел как сбой, хотя первый запуск удался — пусть текст скажет об этом сам
             sys.exit(f"Задача '{self.task}' уже выполняется другим процессом (pipeline/{self.task}/.lock). "
-                     f"Проверь: ps aux | rg duo_pipeline")
+                     f"Если это ваш недавний запуск — серия уже идёт, повторный запуск отбит штатно. "
+                     f"Состояние: `duo status --task {self.task}`; журнал: "
+                     f"tail -f pipeline/{self.task}/orchestrator.log; ждать события: `duo wait --task {self.task}`")
 
     def release_lock(self) -> None:
         """Снять .lock до выхода процесса (pipework2: короткие мутирующие команды
@@ -3479,24 +3497,35 @@ class Pipeline:
                             "at": datetime.now().isoformat(timespec="seconds")}
         if cur not in ("plan", "impl"):
             resumable = False                # solo и прочее: возобновления с места нет — решает человек
-        desktop = bool((self.cfg.get("notify") or {}).get("desktop"))
         st["phase"] = "needs_human"
         st["stop_reason"] = reason
-        st["halt"] = {"kind": kind, "phase": cur, "resumable": bool(resumable), "notified": desktop,
+        st["halt"] = {"kind": kind, "phase": cur, "resumable": bool(resumable), "notified": False,
                       "at": datetime.now().isoformat(timespec="seconds")}
         self.save_state(st)
         log(self.task_dir, f"СТОП: {reason}")
-        self._notify(f"{self.task}: остановка ({kind})", reason[:200])
+        # `notified` — факт ПРИНЯТОГО демоном уведомления, а не «ключ включён»: надзор пропускает своё
+        # уведомление, если оркестратор уже уведомил, и при молча проглоченной ошибке остановка
+        # (needs_human) осталась бы вообще без уведомления (полевой разбор 19.11.2026)
+        if self._notify(f"{self.task}: остановка ({kind})", reason[:200]):
+            st["halt"]["notified"] = True
+            self.save_state(st)
 
-    def _notify(self, title: str, body: str) -> None:
-        """Best-effort десктоп-уведомление (notify.desktop в config.json; в тестах выключено)."""
+    def _notify(self, title: str, body: str) -> bool:
+        """Десктоп-уведомление (notify.desktop; в тестах выключено). True — только если notify-send
+        принял его (rc=0); причина неудачи пишется в orchestrator.log, а не глотается молча."""
         if not (self.cfg.get("notify") or {}).get("desktop"):
-            return
+            return False
         try:
-            subprocess.run(["notify-send", "-u", "critical", "-t", "0", title, body],
-                           timeout=5, capture_output=True)
-        except Exception:
-            pass
+            r = subprocess.run(["notify-send", "-u", "critical", "-t", "0", title, body],
+                               timeout=5, capture_output=True)
+        except Exception as e:
+            log(self.task_dir, f"УВЕДОМЛЕНИЕ: notify-send не доставил ({type(e).__name__}: {e})")
+            return False
+        if r.returncode != 0:
+            err = (r.stderr or b"").decode(errors="replace").strip()[:120]
+            log(self.task_dir, f"УВЕДОМЛЕНИЕ: notify-send rc={r.returncode} {err}".rstrip())
+            return False
+        return True
 
     @staticmethod
     def _rework_label(st: dict) -> str:
@@ -4634,6 +4663,9 @@ def cmd_commit_by_plan(cfg: dict, args) -> None:
         print("\n--dry-run: коммитов нет")
         print("предсказание для `--yes`: ОТКАЖЕТ — " + "; ".join(predicted) if predicted
               else "предсказание для `--yes`: пройдёт (аномалий плана и чужого staging нет)")
+        print(f"COMMIT-RESULT: dry-run yes={'refuse' if predicted else 'pass'} "
+              f"uncovered={len(snap['uncovered'])} overlaps={len(snap['overlaps'])} "
+              f"warnings={len(warnings)} rc={1 if predicted else 0}")
         sys.exit(1 if predicted else 0)
 
     staged = staged_paths(p.work_path)
@@ -4711,7 +4743,24 @@ def cmd_commit_by_plan(cfg: dict, args) -> None:
     print(f"пересечения (overlap): {len(snap['overlaps'])}")
     if snap["artifacts"]:
         print(f"артефакты задачи (коммитятся отдельно): {snap['artifacts']}")
-    sys.exit(1 if (skipped or failed or empty or snap["uncovered"] or snap["overlaps"] or warnings) else 0)
+    # Н18 (полевые разборы 19.11.2026): код 1 при успешных коммитах читали как сбой, а источник
+    # «хвостов» приходилось угадывать. Код возврата НЕ меняем (его ждут скрипты) — объясняем вердикт.
+    tails = [f"{label}={len(items)}" for label, items in
+             (("skipped", skipped), ("failed", failed), ("empty", empty), ("uncovered", snap["uncovered"]),
+              ("overlaps", snap["overlaps"]), ("warnings", warnings)) if items]
+    rc_final = 1 if tails else 0
+    if failed:
+        print(f"ИТОГ: есть НЕ удавшиеся коммиты групп ({', '.join(failed)}) — разберись до остального")
+    elif tails:
+        print(f"ИТОГ: коммиты групп прошли ({len(committed)}), код 1 — из-за хвостов, а не из-за сбоя "
+              f"коммита: {', '.join(tails)}. Файлы вне групп (uncovered) — закоммить вручную или "
+              f"дополни `## commit_plan`")
+    else:
+        print("ИТОГ: все группы закоммичены, хвостов нет")
+    print(f"COMMIT-RESULT: committed={len(committed)} skipped={len(skipped)} failed={len(failed)} "
+          f"empty={len(empty)} uncovered={len(snap['uncovered'])} overlaps={len(snap['overlaps'])} "
+          f"warnings={len(warnings)} rc={rc_final}")
+    sys.exit(rc_final)
 
 
 # ----------------------------------------------------------------------------
@@ -4751,12 +4800,22 @@ def run_detached(cfg: dict, task: str, argv: list[str] | None = None) -> None:
     time.sleep(DETACHED_CONFIRM_SEC)
     if proc.poll() is not None:
         tail = bg_log.read_text(encoding="utf-8", errors="replace").strip().splitlines()[-5:]
-        print("оркестратор умер при старте; хвост orchestrator_bg.log:")
-        for ln in tail:
-            print(f"  {ln}")
+        if lock_held(task_dir):
+            # ребёнка отбил .lock: другой процесс уже ведёт серию (чаще всего — ваш предыдущий запуск)
+            print(f"серия '{task}' УЖЕ выполняется другим процессом (.lock занят) — этот запуск отбит штатно, "
+                  f"это не сбой оркестратора. Состояние: `duo status --task {task}`; "
+                  f"журнал: tail -f {task_dir / 'orchestrator.log'}")
+        else:
+            print("оркестратор умер при старте; хвост orchestrator_bg.log:")
+            for ln in tail:
+                print(f"  {ln}")
         sys.exit(proc.returncode or 1)
     print(f"PID {proc.pid} | detached (новая сессия, жив на момент +{DETACHED_CONFIRM_SEC:.0f}с)")
     print(f"лог: tail -f {task_dir / 'orchestrator.log'} | консоль: tail -f {bg_log}")
+    # три независимых отчёта 19.11.2026: оператор после запуска не держал ожидание события и терял
+    # минуты простоя; команда ожидания — прямо в момент запуска, чтобы не вспоминать её по памяти
+    print(f"ждать события (в фоне; для агента — notify_on_output по `WAIT-RESULT`): "
+          f"duo wait --task {task} --poll 30")
 
 
 TASK_TEMPLATE_MARK = "Опиши задачу здесь."
@@ -5028,6 +5087,13 @@ def cmd_status(cfg: dict, args) -> None:
     info = classify_task(p.task_dir, stale_sec=sup_cfg(cfg)["stale_sec"],
                          dead_max_age_sec=sup_cfg(cfg)["dead_max_age_sec"])
     summ = accepted_plan_summary(st)
+    # Н24: возраст последнего вывода консоли фонового оркестратора. state.json при долгом вызове модели
+    # не меняется минутами, а консоль молчала — серия выглядела зависшей; теперь её «пульс» виден
+    bg_log = p.task_dir / "orchestrator_bg.log"
+    try:
+        console_age = max(0, int(time.time() - bg_log.stat().st_mtime))
+    except OSError:
+        console_age = None
     tel = [t for t in (st.get("review_telemetry") or []) if isinstance(t, dict)]
     stubs = sum(int(t.get("stub_retries", 0) or 0) for t in tel)
     tretry = sum(int(t.get("transport_retries", 0) or 0) for t in tel)
@@ -5044,7 +5110,8 @@ def cmd_status(cfg: dict, args) -> None:
                        "limit_usd": limit, "extra_usd": extra},
             "claim": ({"released": claim_released_now, "paths": len(claim.get("paths") or []),
                        "declared": bool(claim.get("declared"))} if isinstance(claim, dict) else None),
-            "process": {"kind": info["kind"], "alive": bool(info["alive"]), "age_sec": info.get("age_sec")},
+            "process": {"kind": info["kind"], "alive": bool(info["alive"]), "age_sec": info.get("age_sec"),
+                        "console_age_sec": console_age},
             "halt": info.get("halt") or None, "stop_reason": info.get("stop_reason") or None,
             "accepted_plan": summ if st.get("phase") in ("impl_pending", "impl", "done") else None,
             "review_transport": {"stub_retries": stubs, "transport_retries": tretry,
@@ -5063,6 +5130,9 @@ def cmd_status(cfg: dict, args) -> None:
               f"{'' if claim.get('declared') else ' (зона не заявлена планом)'}")
     print(f"процесс: {info['kind']} (lock {'занят' if info['alive'] else 'свободен'}, "
           f"state обновлён {info.get('age_sec', 0)} с назад)")
+    if info["alive"] and console_age is not None:
+        print(f"консоль (orchestrator_bg.log): последний вывод {console_age} с назад — пульс идёт раз в "
+              f"{TRANSPORT_HEARTBEAT_SEC:.0f} с тишины; признак жизни — занятый lock, а не свежесть state")
     if info.get("halt"):
         h = info["halt"]
         print(f"остановка: kind={h.get('kind')} phase={h.get('phase')} resumable={h.get('resumable')} — {info['stop_reason']}")
@@ -5184,9 +5254,13 @@ def supervise_tick(cfg: dict, *, auto_resume: bool | None = None, now: float | N
                              else "план принят — ждёт запуска имплементации")
                     act = {"task": task, "project": project, "kind": info["phase"], "action": "notice",
                            "reason": label}
-                    if (cfg.get("notify") or {}).get("desktop") and not dry_run:
-                        with contextlib.suppress(Exception):
-                            notify(f"duo {project}/{task}: {label}", f"потрачено ${info.get('spent_usd', 0):.2f}")
+                    if not (cfg.get("notify") or {}).get("desktop"):
+                        act["notify"] = "выключено (notify.desktop=false)"
+                    elif dry_run:
+                        act["notify"] = "dry-run: не отправляется"
+                    else:
+                        act["notify"] = _deliver_notice(notify, f"duo {project}/{task}: {label}",
+                                                        f"потрачено ${info.get('spent_usd', 0):.2f}")
                     actions.append(act)
             continue
         if info["kind"] not in ("dead", "halted"):
@@ -5198,11 +5272,15 @@ def supervise_tick(cfg: dict, *, auto_resume: bool | None = None, now: float | N
         if rec.get("alerted") != event_key:
             rec["alerted"] = event_key
             act["action"] = "alert"
-            if ((cfg.get("notify") or {}).get("desktop") and not dry_run
-                    and not (info.get("halt") or {}).get("notified")):      # оркестратор уже уведомил сам
-                with contextlib.suppress(Exception):
-                    notify(f"duo {project}/{task}: {info['kind']}",
-                           (info.get("stop_reason") or "оркестратор умер без halt")[:200])
+            if not (cfg.get("notify") or {}).get("desktop"):
+                act["notify"] = "выключено (notify.desktop=false)"
+            elif dry_run:
+                act["notify"] = "dry-run: не отправляется"
+            elif (info.get("halt") or {}).get("notified"):
+                act["notify"] = "уже принято демоном при остановке (оркестратор)"
+            else:
+                act["notify"] = _deliver_notice(notify, f"duo {project}/{task}: {info['kind']}",
+                                                (info.get("stop_reason") or "оркестратор умер без halt")[:200])
         resumable = (info["kind"] == "dead" or
                      ((info.get("halt") or {}).get("resumable") and (info["halt"].get("kind") in sup["auto_resume_kinds"])))
         if auto and resumable:
@@ -5227,6 +5305,28 @@ def supervise_tick(cfg: dict, *, auto_resume: bool | None = None, now: float | N
     return actions
 
 
+def _deliver_notice(notify, title: str, body: str) -> str:
+    """Отправить уведомление и вернуть ИТОГ строкой для журнала надзора. Раньше результат
+    `notify-send` терялся (rc не проверялся, исключения глотались), и по журналу нельзя было отличить
+    «не отправлено» от «принято демоном, но человек не заметил» (полевой разбор 19.11.2026).
+    rc=0 означает лишь, что демон уведомлений ПРИНЯЛ сообщение, а не что его увидели. Функция
+    `notify`, вернувшая None (подмена в тестах/хуках), считается отправкой без проверки результата."""
+    try:
+        res = notify(title, body)
+    except FileNotFoundError:
+        return "НЕ доставлено: notify-send не установлен"
+    except subprocess.TimeoutExpired:
+        return "НЕ доставлено: notify-send завис (таймаут 5 с)"
+    except Exception as e:
+        return f"НЕ доставлено: {type(e).__name__}: {e}"[:160]
+    rc = getattr(res, "returncode", 0)
+    if rc:
+        err = getattr(res, "stderr", b"") or b""
+        err = err.decode(errors="replace") if isinstance(err, bytes) else str(err)
+        return f"НЕ доставлено: notify-send rc={rc} {err.strip()[:120]}".rstrip()
+    return "принято демоном уведомлений (notify-send rc=0)"
+
+
 def cmd_supervise(cfg: dict, args, *, single: bool) -> None:
     """Один тик надзора (systemd-timer) либо `--loop --interval N` (без systemd: nohup/tmux).
     R8 (duoportable): single=True — ровно один проект (явный --repo/DUO_REPO либо legacy-ключ
@@ -5248,7 +5348,8 @@ def cmd_supervise(cfg: dict, args, *, single: bool) -> None:
                                        dry_run=args.dry_run))
         for a in acts:
             print(f"SUPERVISE: [{a.get('project', '?')}] {a['task']} {a['kind']} → {a['action']} :: "
-                  f"{str(a['reason'])[:200]}", flush=True)
+                  f"{str(a['reason'])[:200]}" + (f" | уведомление: {a['notify']}" if a.get("notify") else ""),
+                  flush=True)
         if not acts and not args.loop:
             print("SUPERVISE: все серии в порядке (нет dead/halted)")
         if not args.loop:
@@ -5374,13 +5475,35 @@ def cmd_errata(cfg: dict, args) -> None:
           + ("" if got == len(sigs) else f"; перенести: errata --task {args.task} --apply"))
 
 
+def _head_series_status(cfg: dict, repo: Path, target: str) -> tuple[str, str, str] | None:
+    """Н19 (полевой разбор 19.11.2026): если HEAD основного дерева — ветка СЕРИИ (`duo/<другая>`), то
+    `merge` ляжет в неё. Возвращает (серия, вид, деталь): live — серия не завершена или её оркестратор
+    жив; done — принята; unknown — состояния нет/нечитаемо. None — HEAD не ветка серии."""
+    prefix = cfg["git"]["branch_prefix"]
+    if not prefix or not target.startswith(prefix):
+        return None
+    other = target[len(prefix):]
+    task_dir = Path(repo) / cfg["artifacts_dir"] / other
+    try:
+        st = json.loads((task_dir / "state.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return other, "unknown", ""
+    phase = str(st.get("phase") or "?")
+    alive = lock_held(task_dir)
+    if phase == "done" and not alive:
+        return other, "done", phase
+    return other, "live", f"phase={phase}" + (", оркестратор жив" if alive else "")
+
+
 def cmd_merge(cfg: dict, args) -> int:
     """Влить принятую worktree-серию (ветка duo/<task>) в ТЕКУЩУЮ ветку основного дерева.
 
     Порядок безопасности: (1) только worktree-серия в phase=done (--force — иначе), worktree чист
     (коммиты — `commit-by-plan`); (2) сухая проверка `git merge-tree --write-tree` — конфликты
     видны ДО касания дерева; конфликты разрешаются в worktree серии (`git merge <ветка-цели>`),
-    не в основном дереве; (3) `git merge --no-ff`; провал — `merge --abort`, дерево как было;
+    не в основном дереве; (2б) отказ, если HEAD основного дерева — ветка ЖИВОЙ другой серии
+    (`duo/<другая>` не в phase=done): слияние легло бы в её ветку посреди работы (Н19; `--force` —
+    на свой риск); (3) `git merge --no-ff`; провал — `merge --abort`, дерево как было;
     (4) зона записи отпускается (параллельные серии больше не блокируются), worktree
     удаляется (симлинки provisioning снимаются заранее — `--force` не нужен). Ветка остаётся.
     Код выхода: 0 — слито / нечего сливать / dry-run без конфликтов; 1 — конфликты или отказ."""
@@ -5438,6 +5561,25 @@ def _merge_locked(cfg: dict, args, p: Pipeline) -> int:
         if not args.dry_run:
             _finish_merge(cfg, p, st, target, merged=False, keep=args.keep_worktree)
         return 0
+    hs = _head_series_status(cfg, repo, target)
+    if hs:
+        other, kind, detail = hs
+        if kind == "live":
+            msg = (f"HEAD основного дерева — ветка {target} НЕ завершённой серии «{other}» ({detail}): "
+                   f"слияние {branch} ляжет в её ветку и в её рабочее дерево посреди работы — исполнитель "
+                   f"и ревьюеры увидят чужой код, ревью получит чужую базу")
+            if not args.force:
+                print(f"ОТКАЗ: {msg}")
+                print(f"Дождись приёмки «{other}» (`duo wait --task {other}`) либо переключи основное дерево "
+                      f"на целевую ветку (`git switch <основная>`) и повтори; `--force` — на свой риск")
+                return 1
+            print(f"ВНИМАНИЕ (--force): {msg}")
+        elif kind == "done":
+            print(f"ВНИМАНИЕ: HEAD основного дерева — ветка {target} принятой серии «{other}», а не основная: "
+                  f"слияние ляжет в неё. Если это не задумано — `git switch <основная>` и повтор")
+        else:
+            print(f"ВНИМАНИЕ: HEAD основного дерева — ветка {target} с префиксом серий, но состояния серии "
+                  f"«{other}» нет/нечитаемо: проверь, что слияние должно лечь именно в неё")
     _, stat = sh(["git", "diff", "--stat", f"HEAD...{branch}"], cwd=repo)
     print(f"{branch} → {target}: +{n_commits} коммит(ов)\n{stat.rstrip()}")
     rc, out = sh(["git", "merge-tree", "--write-tree", "--name-only", "HEAD", branch], cwd=repo, timeout=300)
@@ -6109,7 +6251,7 @@ def main() -> None:
     p.add_argument("--dry-run", action="store_true", help="только проверить: что войдёт и будут ли конфликты")
     p.add_argument("--yes", action="store_true", help="не спрашивать подтверждение")
     p.add_argument("--keep-worktree", action="store_true", help="после слияния не удалять worktree серии")
-    p.add_argument("--force", action="store_true", help="разрешить слияние серии не в phase=done")
+    p.add_argument("--force", action="store_true", help="разрешить слияние серии не в phase=done и слияние в ветку ЖИВОЙ другой серии")
     p = sub.add_parser("claims", help="зоны записи работающих worktree-серий; --drop отпускает зону брошенной серии")
     p.add_argument("--task", help="показать/отпустить зону только этой серии")
     p.add_argument("--drop", action="store_true", help="отпустить зону серии --task (серия не должна быть запущена)")

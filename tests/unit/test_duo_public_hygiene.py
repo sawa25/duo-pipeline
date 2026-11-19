@@ -17,7 +17,7 @@ SELF = Path(__file__).resolve()
 
 DENY = re.compile(
     r"vca|speedlim|mocalib|amdtdlc|m2group|ingests\w*|segreuse|grpspeed|tdlcguard|wdlag|a3_registry|99-TODO"
-    r"|ydav|panelspeed|\boura\b"
+    r"|ydav|panelspeed|\boura\b|mosaicfork|technocore"
     r"|/home/sawa|aspek@|minisserver|sawaTitan|minis128",
     re.IGNORECASE)
 
