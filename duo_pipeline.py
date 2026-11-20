@@ -24,13 +24,21 @@ duo_pipeline.py — оркестратор пайплайна «исполнит
 Подкоманды:
   init        --task NAME [--task-file F] [--mode duo|pair] [--worktree]   создать задачу (task.md, state.json)
   run         --task NAME [--fg] [--continue|--resume] [--mode M] [--worktree] [--solo]
-              [--allow-shared-parallel] [--ignore-claims]
+              [--allow-shared-parallel] [--ignore-claims] [--wait-resources SEC]
                                               цикл: план -> ревью -> правки -> ... -> имплементация
                                               (без --fg — detached: ре-экзек в новой сессии,
                                               переживает закрытие терминала; --fg — старое поведение)
   merge       --task NAME [--dry-run] [--yes] [--keep-worktree] [--force]   влить принятую worktree-серию
                                               (ветка duo/NAME) в текущую ветку; конфликты видны до касания дерева
   claims      [--task NAME [--drop]]           зоны записи работающих worktree-серий; --drop отпускает зону брошенной
+  accept      --task NAME [--dry-run] [--json] [--wait-resources SEC]   живая приёмка: шаги проекта в дереве
+                                              серии под замками ресурсов; PASS/FAIL/INCONCLUSIVE -> state.json,
+                                              код 0/1/2; phase серии не меняет
+                                              (логика шагов: accept_cmd.py рядом с оркестратором)
+  audit       --task NAME [--json] [--archive]   что исполнитель реально вызывал (Bash/Read/Write…) по журналу
+                                              сессии CLI + проверка правил `audit`; код 0 чисто / 1 нарушения /
+                                              2 проверить нельзя; ничего не блокирует (блокируют `executor_deny`)
+                                              (логика: audit_cmd.py рядом с оркестратором)
   review      --task NAME --artifact PATH      разовое дуо-ревью артефакта (пилот/ручной режим)
   status      --task NAME [--json] | --all     состояние задачи / сводная таблица всех задач (+ процесс: lock/liveness);
                                               --json — ровно один JSON-объект без прозы (для скриптов оператора)
@@ -238,7 +246,177 @@ DEFAULTS = {
         "resume_window_sec": 21600,
     },
     "notify": {"desktop": False},       # notify-send при остановке (в config.json — true)
+    # Н26 (полевой отчёт 20.11.2026): исполнитель идёт с --dangerously-skip-permissions, и «НЕ делай X» в
+    # task.md — лишь просьба. Здесь — ТЕХНИЧЕСКИЕ запреты: правила `--disallowedTools` claude CLI
+    # (`Bash(adb:*)`, `Read(./.env)`, `Edit(./config/**)`…), действуют и в bypass-режиме (проверено
+    # 2.1.215). Только исполнитель (mode=full); ревьюеры и так read-only. Префиксные паттерны Bash
+    # обходятся интерпретатором (`python -c`, `bash -c`) — это ограда от ошибок, не от злого умысла.
+    "executor_deny": [],
+    # Н25: правила `duo audit` — проверка ПОСТФАКТУМ по журналу сессии исполнителя.
+    # deny_bash/deny_read/deny_script — списки regex (по тексту Bash-команд / путям Read / телу записанных
+    # .py/.sh); write_zones — каталоги дерева серии, куда писать МОЖНО (`{task}` подставляется).
+    "audit": {"deny_bash": [], "deny_read": [], "deny_script": [], "write_zones": []},
+    # Н28: общие ресурсы проекта (телефон, GPU, эмулятор, порт) — имена машинных замков flock; серия
+    # берёт их на всю жизнь `run`, вторая серия на том же ресурсе получает отказ с именем держателя
+    # (или ждёт: `run --wait-resources SEC`). Ресурс — договорённость по имени, не угадывание железа.
+    "resources": [],
+    # Н27: шаги живой приёмки (`duo accept`): `argv` без shell, как у gates.steps; опционально
+    # `name`, `inconclusive_rc` (rc «устройство недоступно» — не провал), `timeout_sec`. Идут в дереве серии
+    # под замками `resources`; вердикт PASS/FAIL/INCONCLUSIVE пишется в state.json, `phase` не меняется.
+    "acceptance": {"steps": []},
 }
+
+
+def executor_deny_rules(cfg: dict) -> list[str]:
+    """Правила `executor_deny` без пустых элементов (порядок и дубли сохраняются как заданы)."""
+    return [str(r).strip() for r in (cfg.get("executor_deny") or []) if str(r).strip()]
+
+
+def guard_config_problems(cfg: dict) -> list[str]:
+    """Ошибки в `executor_deny`/`audit`/`resources` — проверяются ЛЕНИВО при `run`, не в `load_config`
+    (там SystemExit убил бы `supervise`, который обходит реестр чужих проектов)."""
+    bad: list[str] = []
+    deny = cfg.get("executor_deny") or []
+    if not isinstance(deny, list):
+        bad.append("executor_deny должен быть списком строк")
+    else:
+        for r in deny:
+            if not isinstance(r, str) or not r.strip():
+                bad.append(f"executor_deny: пустое/нестроковое правило {r!r}")
+            elif "," in r:
+                bad.append(f"executor_deny: запятая в правиле {r!r} — правила склеиваются запятой в один "
+                           f"аргумент CLI; для двух вариантов добавь два правила")
+    res = cfg.get("resources") or []
+    if not isinstance(res, (list, dict)):
+        bad.append("resources должен быть списком имён")
+    else:
+        for n in res:
+            if not isinstance(n, str) or not n.strip():
+                bad.append(f"resources: пустое/нестроковое имя {n!r}")
+    aud = cfg.get("audit")
+    aud = {} if aud is None else aud
+    if not isinstance(aud, dict):
+        bad.append("audit должен быть объектом")
+    else:
+        for k in ("deny_bash", "deny_read", "deny_script", "write_zones"):
+            if not isinstance(aud.get(k) or [], list):
+                bad.append(f"audit.{k} должен быть списком")
+        for k in ("deny_bash", "deny_read", "deny_script"):
+            for pat in (aud.get(k) if isinstance(aud.get(k), list) else []):
+                try:
+                    re.compile(str(pat))
+                except re.error as e:
+                    bad.append(f"audit.{k}: некорректный regex {pat!r}: {e}")
+    return bad
+
+
+# ---------- Н28: машинные замки общих ресурсов -------------------------------------------------
+
+def resources_dir() -> Path:
+    base = os.environ.get("XDG_STATE_HOME") or str(Path.home() / ".local" / "state")
+    return Path(base) / "duo-pipeline" / "resources"
+
+
+def resource_lock_path(name: str) -> Path:
+    """Имя ресурса → файл замка. Допустимые символы сохраняются (`adb:phone-1` → `adb_phone-1.lock`),
+    остальные заменяются; два имени, различающихся лишь заменяемыми символами, делят замок —
+    для этого и нужен единый путь, а не угадывание."""
+    return resources_dir() / (re.sub(r"[^A-Za-z0-9._-]", "_", name) + ".lock")
+
+
+def resource_holder(name: str) -> dict | None:
+    """None — ресурс свободен; иначе то, что держатель записал о себе ({} — держит кто-то без записи,
+    например shell-`flock`). Проба берёт разделяемую блокировку без ожидания и тут же её отпускает —
+    держателя не тревожит."""
+    path = resource_lock_path(name)
+    try:
+        fd = os.open(str(path), os.O_RDONLY)
+    except OSError:
+        return None
+    try:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
+        except BlockingIOError:
+            try:
+                data = json.loads(path.read_text(encoding="utf-8") or "{}")
+                return data if isinstance(data, dict) else {}
+            except (OSError, ValueError):
+                return {}
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        return None
+    finally:
+        os.close(fd)
+
+
+def format_holder(holder: dict) -> str:
+    if not holder:
+        return "внешний процесс (замок держит кто-то без записи о себе, например shell-`flock`)"
+    return (f"серия {holder.get('project', '?')}/{holder.get('task', '?')} "
+            f"(pid {holder.get('pid', '?')}, с {holder.get('since', '?')})")
+
+
+def acquire_resources(names: list[str], info: dict, wait_sec: float = 0.0,
+                      on_wait=None, poll_sec: float = 2.0) -> list[int]:
+    """Берёт замки по именам в АЛФАВИТНОМ порядке (две серии с пересекающимися наборами не заклинят друг
+    друга). Занято → ждёт до wait_sec (0 — отказ сразу), иначе `RuntimeError` с именем держателя; уже
+    взятые замки при отказе отпускаются. Возвращает дескрипторы для `release_resources`."""
+    taken: list[int] = []
+    deadline = time.time() + max(0.0, wait_sec)
+    resources_dir().mkdir(parents=True, exist_ok=True)
+    try:
+        for name in sorted(set(names)):
+            path = resource_lock_path(name)
+            fd = os.open(str(path), os.O_RDWR | os.O_CREAT, 0o600)
+            warned = False
+            while True:
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except BlockingIOError:
+                    if time.time() >= deadline:
+                        holder = resource_holder(name) or {}
+                        os.close(fd)
+                        raise RuntimeError(
+                            f"ресурс {name!r} занят: {format_holder(holder)}. Дождись освобождения, "
+                            f"запусти с `--wait-resources SEC` или освободи ресурс (замок: {path}).") from None
+                    if not warned and on_wait:
+                        on_wait(name, resource_holder(name) or {})
+                        warned = True
+                    time.sleep(min(poll_sec, max(0.05, deadline - time.time())))
+            os.ftruncate(fd, 0)
+            os.write(fd, json.dumps(info, ensure_ascii=False).encode("utf-8"))
+            taken.append(fd)
+    except BaseException:
+        release_resources(taken)
+        raise
+    return taken
+
+
+def release_resources(fds: list[int]) -> None:
+    for fd in fds:
+        try:
+            os.ftruncate(fd, 0)     # замок отпускается закрытием; запись о держателе не должна пережить его
+        except OSError:
+            pass
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+
+
+def model_label(cfg: dict, alias: str | None = None) -> str:
+    """Н29: в логе — не только алиас (`sonnet`), но и во что он отображается в профиле CLI
+    (`ANTHROPIC_DEFAULT_<АЛИАС>_MODEL` из `<claude_config_dir>/settings.json`: sonnet → glm-5.3-flash).
+    Читается ТОЛЬКО эта переменная: рядом в settings.json лежат токены — их в лог не тащим."""
+    alias = alias or str(cfg.get("model") or "?")
+    cdir = str(cfg.get("claude_config_dir") or "")
+    real = None
+    try:
+        env = (load_json(Path(cdir) / "settings.json").get("env") or {})
+        real = env.get(f"ANTHROPIC_DEFAULT_{alias.upper()}_MODEL")
+    except (OSError, ValueError, AttributeError):
+        pass
+    return f"{alias} → {real}" if isinstance(real, str) and real else alias
 
 
 @contextlib.contextmanager
@@ -541,8 +719,14 @@ class ClaudeGlm:
         N минут тишины подряд (idle-таймаут). timeout теперь = секунды тишины.
         Возвращает (text, session_id, cost_usd).
         """
-        cmd = ["claude", "-p", "--model", self.model,
-               "--output-format", "stream-json", "--verbose"]
+        cmd = ["claude", "-p"]
+        deny = executor_deny_rules(self.cfg) if mode == "full" else []
+        if deny:
+            # Н26. `--disallowedTools` — ВАРИАДИЧЕСКАЯ опция: без следующего за ней флага она «съест»
+            # позиционный промпт (он добавляется в конец). Здесь за ней всегда идёт `--model` — порядок
+            # не менять (закреплено тестом test_executor_deny_flag_is_followed_by_a_flag).
+            cmd += ["--disallowedTools", ",".join(deny)]
+        cmd += ["--model", self.model, "--output-format", "stream-json", "--verbose"]
         if mode == "plan":
             cmd += ["--permission-mode", "plan"]
         else:
@@ -570,6 +754,7 @@ class ClaudeGlm:
         cost = 0.0
         got_result = False
         last_activity = time.time()
+        call_started = last_activity
         next_beat = last_activity + TRANSPORT_HEARTBEAT_SEC
         idle_killed = False
         while True:
@@ -616,7 +801,11 @@ class ClaudeGlm:
                         inp = block.get("input", {})
                         brief = inp.get("file_path") or inp.get("command") or inp.get("pattern") or ""
                         brief = str(brief)[:80]
-                        print(f"    · {name}({brief})", flush=True)
+                        # Н25-прогресс: «[прошло мм:сс #N]» — по хвосту bg-лога видно, что вызов идёт и
+                        # сколько действий сделано, без захода в журнал сессии
+                        el = int(time.time() - call_started)
+                        n_calls = self.take_call_stats()["tool_uses"]
+                        print(f"    · [{el // 60:02d}:{el % 60:02d} #{n_calls}] {name}({brief})", flush=True)
             elif et == "result":
                 # финальный текст берём из result-события; дубли не копим
                 session_id = ev.get("session_id")
@@ -2382,6 +2571,12 @@ class Executor:
         """Учёт стоимости/сессии и транскрипт шага (и при успехе, и при окончательном сбое:
         pipework3 — после провала сессия остаётся известной, стоимость не теряется)."""
         self.state["executor_session"] = new_sid or sid
+        # Н25: история ВСЕХ сессий исполнителя серии (resume после падения порождает новый id) —
+        # `duo audit` разбирает все, а не только последнюю
+        hist = self.state.setdefault("executor_sessions", [])
+        for s in (sid, new_sid):
+            if s and s not in hist:
+                hist.append(s)
         self.state["spent_usd"] = round(self.state.get("spent_usd", 0.0) + cost, 4)
         (self.task_dir / "transcripts").mkdir(exist_ok=True)
         f = self.task_dir / "transcripts" / f"{datetime.now().strftime('%H%M%S')}_{tag}.md"
@@ -2920,6 +3115,7 @@ class Pipeline:
         self.guard = GitGuard(self.work_path, never_revert)   # статус/дифф/гварды — по дереву серии
         self.main_guard = GitGuard(self.repo, never_revert)   # worktree-администрация — из основного дерева
         self._lock_fd = None
+        self._res_fds: list[int] = []      # Н28: замки общих ресурсов (живут, пока жив `run`)
 
     def _peek_state(self) -> dict:
         """Состояние без выхода при отсутствии/порче (для разрешения режима/изоляции в __init__)."""
@@ -2953,7 +3149,10 @@ class Pipeline:
     def release_lock(self) -> None:
         """Снять .lock до выхода процесса (pipework2: короткие мутирующие команды
         set-verdict/rework/hold обязаны отпустить блокировку до `run --run` —
-        иначе detached-ребёнок получит «уже выполняется»)."""
+        иначе detached-ребёнок получит «уже выполняется»). Замки ресурсов (Н28) отпускаются здесь же."""
+        if getattr(self, "_res_fds", None):
+            release_resources(self._res_fds)
+            self._res_fds = []
         if self._lock_fd is not None:
             try:
                 fcntl.flock(self._lock_fd, fcntl.LOCK_UN)
@@ -3661,16 +3860,21 @@ class Pipeline:
 
     def run(self, phases: str = "auto", force_continue: bool = False, add_budget: float = 0.0,
             add_iterations: int = 0, resume: bool = False, allow_shared_parallel: bool = False,
-            ignore_claims: bool = False) -> None:
+            ignore_claims: bool = False, wait_resources: float = 0.0) -> None:
         """Цикл серии. pipework3: любая необработанная ошибка превращается в чистую остановку
         (halt: state + лог), а не в молчаливую смерть процесса с phase=plan|impl.
 
         allow_shared_parallel — разрешить shared-серию при живой другой shared-серии (см.
         _shared_parallel_guard); ignore_claims — стартовать имплементацию вопреки пересечению зон
-        записи с серией-держателем (см. _claim_gate)."""
+        записи с серией-держателем (см. _claim_gate); wait_resources — сколько секунд ждать занятый
+        ресурс из `resources` (0 — отказ сразу)."""
+        problems = guard_config_problems(self.cfg)
+        if problems:
+            sys.exit("ОТКАЗ: ошибки конфигурации (executor_deny/audit/resources): " + "; ".join(problems))
         self.acquire_lock()
         self._live_state: dict | None = None
         try:
+            self._take_resources(wait_resources)
             self._run_impl(phases, force_continue, add_budget, add_iterations, resume,
                            allow_shared_parallel, ignore_claims)
         except (KeyboardInterrupt, SystemExit):
@@ -3696,6 +3900,29 @@ class Pipeline:
                       f"(трейс — orchestrator_bg.log). Продолжить: `run --task {self.task} --resume`")
         finally:
             self.release_lock()          # процесс обычно завершается следом; явный release — для вложенных/тестовых вызовов
+
+    def _take_resources(self, wait_sec: float) -> None:
+        """Н26/Н28 на старте `run` (после `.lock`, до любого изменения серии): строка в лог о включённых
+        технических запретах и захват замков общих ресурсов. Отказ по ресурсу — `sys.exit` без правок
+        state.json/дерева: серия остаётся в том состоянии, в каком была."""
+        deny = executor_deny_rules(self.cfg)
+        if deny:
+            log(self.task_dir, f"ИСПОЛНИТЕЛЬ: технических запретов {len(deny)} (--disallowedTools): "
+                               f"{', '.join(deny)[:300]}")
+        names = sorted({str(n) for n in (self.cfg.get("resources") or [])})
+        if not names:
+            return
+        info = {"project": self.repo.name, "task": self.task, "pid": os.getpid(),
+                "since": datetime.now().isoformat(timespec="seconds")}
+
+        def on_wait(name: str, holder: dict) -> None:
+            log(self.task_dir, f"РЕСУРС: {name!r} занят ({format_holder(holder)}); жду до {wait_sec:.0f} с")
+
+        try:
+            self._res_fds = acquire_resources(names, info, wait_sec, on_wait)
+        except RuntimeError as e:
+            sys.exit(f"ОТКАЗ: {e}")
+        log(self.task_dir, f"РЕСУРСЫ: захвачены {', '.join(names)} (отпускаются при завершении `run`)")
 
     def _run_impl(self, phases: str, force_continue: bool, add_budget: float, add_iterations: int = 0,
                   resume: bool = False, allow_shared_parallel: bool = False,
@@ -3763,7 +3990,8 @@ class Pipeline:
                 sr.write_text(txt, encoding="utf-8")
             self.save_state(st)
             log(self.task_dir, f"SOLO: режим без план-фазы и дуо-ревью "
-                f"(модель: {self.cfg['model']}); исполнитель выполняет task.md")
+                f"(модель: {model_label(self.cfg)}, профиль {self.cfg.get('claude_config_dir')}); "
+                f"исполнитель выполняет task.md")
         if st["phase"] == "solo":
             ex_s = Executor(self.cfg, self.t, self.task_dir, self.work_path, st)
             max_turns = int(self.cfg.get("solo", {}).get("max_turns", 24))
@@ -4862,6 +5090,9 @@ def cmd_init(cfg: dict, args) -> None:
     leftovers = ([c.name for c in task_dir.iterdir() if c.name not in (".lock", "transcripts")]
                  if task_dir.is_dir() else [])
     had_task = (task_dir / "task.md").exists()
+    # первая серия проекта: ни у одной другой серии нет state.json (определяем ДО создания своего)
+    first_series = not stf.exists() and not any(
+        q.parent != task_dir for q in (repo / cfg["artifacts_dir"]).glob("*/state.json"))
     task_dir.mkdir(parents=True, exist_ok=True)
     (task_dir / "transcripts").mkdir(exist_ok=True)
     tf = task_dir / "task.md"
@@ -4899,6 +5130,13 @@ def cmd_init(cfg: dict, args) -> None:
     elif pins:
         print(f"state.json уже есть — флаги режима/изоляции не применены: передай их в `run --task {args.task}`")
     print(f"OK: {task_dir}\nОтредактируй task.md, затем: duo run --task {args.task}")
+    if first_series:
+        # полевой отчёт 20.11.2026: оператор первой серии не знал, что бриф с граблями уже есть
+        docs = SCRIPT_DIR / "docs"
+        print(f"Первая серия проекта. Прочти до запуска: {docs / 'CHEATSHEET-CONTROL.md'} (команды и грабли), "
+              f"{docs / 'FIELD-TEST-BRIEF.md'} (бриф полевого прогона: известные находки, правила оператора). "
+              f"Серия управляет живым оборудованием (телефон, GPU, порт) — раздел «Серии на живом "
+              f"оборудовании» там же: технические запреты `executor_deny`, ресурсы, `duo audit`.")
 
 
 def resolve_mode_flags(args) -> dict:
@@ -5099,6 +5337,9 @@ def cmd_status(cfg: dict, args) -> None:
     tretry = sum(int(t.get("transport_retries", 0) or 0) for t in tel)
     empty = sum(int(t.get("empty_retries", 0) or 0) for t in tel)
     wt = p.isolation == "worktree"
+    deny = executor_deny_rules(cfg)
+    res_names = sorted({str(n) for n in (cfg.get("resources") or []) if isinstance(n, str)})
+    res_state = {n: resource_holder(n) for n in res_names}     # None — свободен, dict — держатель
     if getattr(args, "json", False):
         # машинный вывод для скриптов оператора: РОВНО один JSON-объект, без прозы (полевой прогон
         # 17.11.2026: `json.load` обычного вывода падал на «Extra data» — JSON состояния + текст)
@@ -5116,6 +5357,7 @@ def cmd_status(cfg: dict, args) -> None:
             "accepted_plan": summ if st.get("phase") in ("impl_pending", "impl", "done") else None,
             "review_transport": {"stub_retries": stubs, "transport_retries": tretry,
                                  "empty_retries": empty, "reviews": len(tel)},
+            "guard": {"executor_deny": deny, "resources": res_state},
             "state": st,
         }, ensure_ascii=False, indent=2, default=str))
         return
@@ -5124,6 +5366,23 @@ def cmd_status(cfg: dict, args) -> None:
           + (f" (в т.ч. добавка серии ${extra:g})" if extra else ""))
     wt_note = (f", дерево {p.work_path}, ветка {cfg['git']['branch_prefix']}{args.task}" if wt else "")
     print(f"режим: {st.get('mode') or '— (не записан; будет duo)'}, изоляция: {p.isolation}{wt_note}")
+    if deny:
+        print(f"технические запреты исполнителя (executor_deny): {len(deny)} — {', '.join(deny)[:200]}")
+    else:
+        print("технические запреты исполнителя: нет — границы задания держатся только на тексте промпта "
+              "(исполнитель идёт в bypass-режиме); `executor_deny` в .duo/config.json включает запреты")
+    for n, holder in res_state.items():
+        print(f"ресурс {n}: " + ("свободен" if holder is None else f"ЗАНЯТ — {format_holder(holder)}"))
+    acc = st.get("acceptance")
+    if isinstance(acc, dict):
+        try:
+            now_head = p.guard.head()
+        except Exception:
+            now_head = None
+        stale = (" — УСТАРЕЛА: HEAD с тех пор изменился"
+                 if acc.get("head") and now_head and acc["head"] != now_head else "")
+        print(f"живая приёмка: {acc.get('verdict')} ({acc.get('at')}, HEAD {str(acc.get('head') or '—')[:8]}, "
+              f"phase на тот момент {acc.get('phase')}){stale}; `done` приёмкой не менялся")
     if isinstance(claim, dict):
         state_txt = "отпущена" if claim_released_now else "держит"
         print(f"зона записи: {state_txt}, заявлено путей: {len(claim.get('paths') or [])}"
@@ -5144,6 +5403,101 @@ def cmd_status(cfg: dict, args) -> None:
     if stubs or tretry or empty:
         print(f"транспорт ревью (деградации, на вердикт обычно не влияют): ответов-заглушек {stubs}, "
               f"транспортных повторов {tretry}, пустых ревью {empty} — по {len(tel)} ревью")
+
+
+def cmd_accept(cfg: dict, args) -> int:
+    """`duo accept --task X [--dry-run] [--json] [--wait-resources SEC]` — живая приёмка (Н27): шаги
+    `acceptance.steps` в дереве серии под замками `resources`; итог — в `state.json["acceptance"]`.
+    Не меняет `phase`. Подробности и вердикты — accept_cmd.py. Коды: 0 PASS, 1 FAIL, 2 иначе."""
+    td = Path(cfg["repo"]).resolve() / cfg["artifacts_dir"] / args.task
+    if not (td / "state.json").exists():
+        sys.exit(f"Задача не найдена: {td}")
+    sys.path.insert(0, str(SCRIPT_DIR))
+    from accept_cmd import RC_BY_VERDICT, aggregate, run_steps, validate_steps
+    as_json = bool(getattr(args, "json", False))
+
+    def say(text: str) -> None:
+        if not as_json:
+            print(text)
+
+    def refuse(msg: str) -> int:
+        print(json.dumps({"task": args.task, "verdict": None, "rc": 2, "error": msg}, ensure_ascii=False,
+                         indent=2) if as_json else msg)
+        return 2
+
+    steps, problems = validate_steps(cfg.get("acceptance"))
+    if problems:
+        return refuse("приёмка невозможна: " + "; ".join(problems))
+    if not steps:
+        return refuse("приёмка не настроена: `acceptance.steps` пуст (.duo/config.json проекта). Живую приёмку "
+                      "оператор тогда делает вручную и фиксирует итог файлом серии")
+    bad = guard_config_problems(cfg)
+    if bad:
+        return refuse("приёмка невозможна: " + "; ".join(bad))
+    p = Pipeline(cfg, args.task)
+    names = sorted({str(n) for n in (cfg.get("resources") or [])})
+    if getattr(args, "dry_run", False):
+        say(f"ПРИЁМКА (dry-run): серия {args.task}, дерево {p.work_path}, ресурсы: {', '.join(names) or '—'}")
+        for s in steps:
+            say(f"  шаг {s['name']}: {' '.join(s['argv'])}  (таймаут {s['timeout_sec']:g} с"
+                + (f"; rc={s['inconclusive_rc']} = INCONCLUSIVE" if s["inconclusive_rc"] is not None else "") + ")")
+        if as_json:
+            print(json.dumps({"task": args.task, "dry_run": True, "cwd": str(p.work_path), "resources": names,
+                              "steps": steps}, ensure_ascii=False, indent=2))
+        return 0
+    try:
+        p.acquire_lock()                   # живая серия (lock занят) — отказ; приёмка идёт после остановки
+    except SystemExit as e:                # rc=1 здесь читался бы как FAIL приёмки — это «проверить нельзя»
+        return refuse(f"приёмка невозможна: {e.code}")
+    fds: list[int] = []
+    try:
+        if names:
+            info = {"project": p.repo.name, "task": args.task, "pid": os.getpid(),
+                    "since": datetime.now().isoformat(timespec="seconds")}
+            try:
+                fds = acquire_resources(names, info, float(getattr(args, "wait_resources", 0.0) or 0.0))
+            except RuntimeError as e:
+                return refuse(f"ОТКАЗ: {e}")
+        say(f"ПРИЁМКА: серия {args.task}, дерево {p.work_path}"
+            + (f", ресурсы: {', '.join(names)}" if names else ""))
+        results = run_steps(steps, cwd=p.work_path, env=dict(os.environ))
+        verdict = aggregate(results)
+        st = p.load_state()
+        try:
+            head = p.guard.head()
+        except Exception:
+            head = None
+        st["acceptance"] = {
+            "verdict": verdict, "at": datetime.now().isoformat(timespec="seconds"),
+            "phase": st.get("phase"), "head": head,
+            # вывод шагов НЕ сохраняется: в нём бывают секреты; только факты
+            "steps": [{k: r[k] for k in ("name", "rc", "verdict", "sec", "reason")} for r in results],
+        }
+        p.save_state(st)
+        # log() дублирует строку в stdout; в --json-режиме stdout — ровно один JSON-объект → строку в stderr
+        with contextlib.redirect_stdout(sys.stderr) if as_json else contextlib.nullcontext():
+            log(p.task_dir, f"ПРИЁМКА: {verdict} ({len(results)} шаг.; "
+                            + ", ".join(f"{r['name']}={r['verdict']}" for r in results) + ")")
+    finally:
+        release_resources(fds)
+        p.release_lock()
+    rc = RC_BY_VERDICT[verdict]
+    if as_json:
+        print(json.dumps({"task": args.task, "verdict": verdict, "rc": rc, "head": head, "steps": results},
+                         ensure_ascii=False, indent=2))
+        return rc
+    for r in results:
+        extra = f", {r['reason']}" if r["reason"] else ""
+        print(f"  [{r['verdict']}] {r['name']} (rc={r['rc']}, {r['sec']} с{extra})")
+        if r["tail"]:
+            print("      " + r["tail"].replace("\n", "\n      "))
+    print(f"ACCEPT-RESULT: verdict={verdict} steps={len(results)} "
+          f"pass={sum(r['verdict'] == 'PASS' for r in results)} "
+          f"fail={sum(r['verdict'] == 'FAIL' for r in results)} "
+          f"inconclusive={sum(r['verdict'] == 'INCONCLUSIVE' for r in results)} rc={rc}")
+    print("phase серии не менялся: `done` — по-прежнему «исполнитель/ревью приняли»; вердикт приёмки — "
+          "в state.json (`acceptance`) и в `status`")
+    return rc
 
 
 # коды выхода `wait` (для скриптов помощника и `notify_on_output`-сторожей)
@@ -6000,7 +6354,7 @@ def cmd_gates(cfg: dict, args, runner: Callable | None = None) -> int:
 
 def cmd_selftest(cfg: dict, args) -> None:
     t = ClaudeGlm(cfg)
-    print(f"профиль: {cfg['claude_config_dir']}, модель-алиас: {cfg['model']}")
+    print(f"профиль: {cfg['claude_config_dir']}, модель-алиас: {model_label(cfg)}")
     pair_cfg = cfg.get("pair") or {}
     pair_members = [m for m in (pair_cfg.get("reviewer_plan"), pair_cfg.get("reviewer_impl")) if m]
     for name in set(cfg["duo"]["members_plan"] + cfg["duo"]["members_impl"] + pair_members):
@@ -6171,6 +6525,9 @@ def main() -> None:
     p.add_argument("--ignore-claims", action="store_true",
                    help="стартовать имплементацию, даже если зона записи пересекается с работающей worktree-серией "
                         "(на свой риск: конфликт при слиянии)")
+    p.add_argument("--wait-resources", type=float, default=0.0, metavar="SEC",
+                   help="если ресурс из `resources` занят другой серией — ждать до SEC секунд "
+                        "(по умолчанию 0: отказ сразу с именем держателя)")
     p.add_argument("--fg", action="store_true",
                    help="foreground, старое поведение (по умолчанию — detached, переживает терминал)")
     p.add_argument("--continue", dest="force_continue", action="store_true",
@@ -6285,6 +6642,20 @@ def main() -> None:
     p.add_argument("--print-digest-template", action="store_true",
                    help="напечатать заготовку дайджеста `### <task>` c механической подстановкой "
                         "(поля-суждения — <заполнить>); <заполнить> в индексе блокирует архивацию")
+    p = sub.add_parser("audit", help="аудит действий исполнителя по журналу его сессии claude CLI "
+                                     "(правила `audit` конфига); read-only, ничего не блокирует")
+    p.add_argument("--task", required=True)
+    p.add_argument("--json", action="store_true", help="ровно один JSON-объект без прозы")
+    p.add_argument("--archive", action="store_true",
+                   help="скопировать журналы сессий в pipeline/<task>/audit/ (gzip, 0600, закрыт .gitignore); "
+                        "МОГУТ СОДЕРЖАТЬ СЕКРЕТЫ из прочитанных файлов — по умолчанию не копируются")
+    p = sub.add_parser("accept", help="живая приёмка: шаги acceptance.steps в дереве серии под замками "
+                                      "ресурсов; вердикт PASS/FAIL/INCONCLUSIVE в state.json (phase не меняется)")
+    p.add_argument("--task", required=True)
+    p.add_argument("--json", action="store_true", help="ровно один JSON-объект без прозы")
+    p.add_argument("--dry-run", action="store_true", help="показать шаги, дерево и ресурсы; ничего не запускать")
+    p.add_argument("--wait-resources", type=float, default=0.0, metavar="SEC",
+                   help="ждать занятый ресурс до SEC секунд (по умолчанию 0: отказ сразу)")
     p = sub.add_parser("projects", help="реестр проектов для мультипроектного надзора (supervise без --repo)")
     p.add_argument("--add", metavar="PATH", help="добавить проект в реестр")
     p.add_argument("--remove", metavar="PATH", help="убрать проект из реестра")
@@ -6346,7 +6717,7 @@ def main() -> None:
         Pipeline(cfg, args.task, mode=pins.get("mode"), isolation=pins.get("isolation")).run(
             force_continue=args.force_continue, add_budget=args.add_budget, add_iterations=args.add_iterations,
             resume=args.resume, allow_shared_parallel=args.allow_shared_parallel,
-            ignore_claims=args.ignore_claims)
+            ignore_claims=args.ignore_claims, wait_resources=args.wait_resources)
     elif args.cmd == "review":
         members = args.members.split(",") if args.members else None
         Pipeline(cfg, args.task).review_once(args.artifact, args.phase, members)
@@ -6378,6 +6749,18 @@ def main() -> None:
         sys.path.insert(0, str(SCRIPT_DIR))
         from archive_cmd import cmd_archive
         sys.exit(cmd_archive(cfg, args))
+    elif args.cmd == "accept":
+        sys.exit(cmd_accept(cfg, args))
+    elif args.cmd == "audit":
+        # логика — в соседнем модуле (как archive); пути/state резолвит Pipeline, но ТОЛЬКО для
+        # существующей серии: без каталога задачи — отказ, а не фантомный pipeline/<опечатка>/
+        td = Path(cfg["repo"]).resolve() / cfg["artifacts_dir"] / args.task
+        if not (td / "state.json").exists():
+            sys.exit(f"Задача не найдена: {td}")
+        sys.path.insert(0, str(SCRIPT_DIR))
+        from audit_cmd import cmd_audit
+        pl = Pipeline(cfg, args.task)
+        sys.exit(cmd_audit(cfg, args, pl.task_dir, pl.work_path, pl.load_state()))
 
 
 if __name__ == "__main__":
