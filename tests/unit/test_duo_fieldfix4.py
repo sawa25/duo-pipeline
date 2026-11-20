@@ -354,7 +354,8 @@ def test_run_detached_prints_wait_hint_on_success(tmp_path: Path, monkeypatch, c
     cfg, td = _detached(tmp_path, monkeypatch, None)                    # ребёнок жив
     duo.run_detached(cfg, "demo", ["run", "--task", "demo"])
     out = capsys.readouterr().out
-    assert "PID 4242" in out and "duo wait --task demo --poll 30" in out and "WAIT-RESULT" in out
+    assert "PID 4242" in out and "duo wait --task demo --timeout 3600 --quiet" in out and "WAIT-RESULT" in out
+    assert "СТОРОЖ" in out and "В ФОНЕ" in out                          # блок, а не строка, которую пролистывают
 
 
 # --- Н24 -------------------------------------------------------------------------

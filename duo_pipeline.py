@@ -254,14 +254,16 @@ DEFAULTS = {
     "executor_deny": [],
     # Н25: правила `duo audit` — проверка ПОСТФАКТУМ по журналу сессии исполнителя.
     # deny_bash/deny_read/deny_script — списки regex (по тексту Bash-команд / путям Read / телу записанных
-    # .py/.sh); write_zones — каталоги дерева серии, куда писать МОЖНО (`{task}` подставляется).
+    # .py/.sh); write_zones — каталоги дерева серии, куда писать МОЖНО (`{task}` подставляется); токен
+    # `@plan` добавляет зону из `## files_touch` принятого плана (файлы/каталоги/globs; у solo — пусто).
     "audit": {"deny_bash": [], "deny_read": [], "deny_script": [], "write_zones": []},
     # Н28: общие ресурсы проекта (телефон, GPU, эмулятор, порт) — имена машинных замков flock; серия
     # берёт их на всю жизнь `run`, вторая серия на том же ресурсе получает отказ с именем держателя
     # (или ждёт: `run --wait-resources SEC`). Ресурс — договорённость по имени, не угадывание железа.
     "resources": [],
     # Н27: шаги живой приёмки (`duo accept`): `argv` без shell, как у gates.steps; опционально
-    # `name`, `inconclusive_rc` (rc «устройство недоступно» — не провал), `timeout_sec`. Идут в дереве серии
+    # `name`, `inconclusive_rc` (rc «устройство недоступно» — не провал), `inconclusive_match` (regex по выводу
+    # при rc != 0 — то же, когда команду не поменять; Н32), `timeout_sec`. Идут в дереве серии
     # под замками `resources`; вердикт PASS/FAIL/INCONCLUSIVE пишется в state.json, `phase` не меняется.
     "acceptance": {"steps": []},
 }
@@ -301,6 +303,9 @@ def guard_config_problems(cfg: dict) -> list[str]:
         for k in ("deny_bash", "deny_read", "deny_script", "write_zones"):
             if not isinstance(aud.get(k) or [], list):
                 bad.append(f"audit.{k} должен быть списком")
+        for z in (aud.get("write_zones") if isinstance(aud.get("write_zones"), list) else []):
+            if not isinstance(z, str) or not z.strip():
+                bad.append(f"audit.write_zones: пустая/нестроковая запись {z!r}")
         for k in ("deny_bash", "deny_read", "deny_script"):
             for pat in (aud.get(k) if isinstance(aud.get(k), list) else []):
                 try:
@@ -4015,6 +4020,7 @@ class Pipeline:
                 if lines and lines[-1] == "SOLO_DONE":
                     st["phase"] = "done"
                     st["stop_reason"] = "solo: исполнитель заявил SOLO_DONE"
+                    st["waiting_since"] = time.time()
                     self.save_state(st)
                     log(self.task_dir, f"SOLO: SOLO_DONE — задача завершена "
                         f"({st.get('spent_usd', 0.0):.2f} USD, {turn} вызов(ов)).")
@@ -4094,6 +4100,7 @@ class Pipeline:
                 st.setdefault("verdicts", []).append({"rev": rev_file.name, "phase": "plan", "verdict": verdict})
                 if verdict == "ACCEPT":
                     st["phase"] = "impl_pending"
+                    st["waiting_since"] = time.time()
                     self.save_state(st)
                     log(self.task_dir, f"План ПРИНЯТ (rev{n:03d}).")
                     self._errata_gate(st, arts_rel)       # pipework3: эрраты председателя → в plan_vN.md
@@ -4219,6 +4226,7 @@ class Pipeline:
                 st.setdefault("verdicts", []).append({"rev": rev_file.name, "phase": "impl", "verdict": verdict})
                 if verdict == "ACCEPT":
                     st["phase"] = "done"
+                    st["waiting_since"] = time.time()
                     self.save_state(st)
                     log(self.task_dir, f"Имплементация ПРИНЯТА (rev{n:03d}). Задача завершена. Дифф: diff_impl_v{cur_v}.patch")
                     # pipev2: коммит-группы размечены исполнителем, разбор на
@@ -5040,10 +5048,14 @@ def run_detached(cfg: dict, task: str, argv: list[str] | None = None) -> None:
         sys.exit(proc.returncode or 1)
     print(f"PID {proc.pid} | detached (новая сессия, жив на момент +{DETACHED_CONFIRM_SEC:.0f}с)")
     print(f"лог: tail -f {task_dir / 'orchestrator.log'} | консоль: tail -f {bg_log}")
-    # три независимых отчёта 19.11.2026: оператор после запуска не держал ожидание события и терял
-    # минуты простоя; команда ожидания — прямо в момент запуска, чтобы не вспоминать её по памяти
-    print(f"ждать события (в фоне; для агента — notify_on_output по `WAIT-RESULT`): "
-          f"duo wait --task {task} --poll 30")
+    # три независимых отчёта 19.11.2026 и повтор 20.11.2026: оператор после запуска не держал ожидание
+    # события и терял минуты простоя; команда ожидания — прямо в момент запуска, и не одной строкой, которую
+    # пролистывают, а блоком: окончание фазы само никому не объявится
+    print("СТОРОЖ: окончание фазы (план принят / код принят / остановка) никто не объявит, пока вы не следите.")
+    print(f"  ждать события В ФОНЕ: duo wait --task {task} --timeout 3600 --quiet   "
+          f"(агенту — с notify_on_output по `WAIT-RESULT`; итог: done|impl_pending|halted|dead|idle|timeout)")
+    print("  `nohup … > файл &` без наблюдения за файлом молчит; уведомления рабочего стола шлёт надзор "
+          "(`duo supervise`, таймер) — журнал: journalctl --user -u duo-supervise.service | grep SUPERVISE")
 
 
 TASK_TEMPLATE_MARK = "Опиши задачу здесь."
@@ -5308,6 +5320,34 @@ def accepted_plan_summary(st: dict) -> str | None:
     return "; ".join(parts)
 
 
+def waiting_info(st: dict, now: float | None = None) -> dict | None:
+    """Серия стоит и ждёт человека (impl_pending / done / needs_human): {"phase", "since", "min"} или None.
+
+    Полевой разбор 20.11.2026: оператор не заметил конец фазы и серия простояла ~17 мин; `status` теперь
+    говорит об этом явно. Точка отсчёта — `waiting_since` (ставится в момент принятия плана / приёмки кода /
+    SOLO_DONE и не двигается записями state после), для остановки — `halt.at`; у старых серий — heartbeat state."""
+    now = time.time() if now is None else now
+    phase = st.get("phase")
+    if phase not in ("impl_pending", "done", "needs_human"):
+        return None
+    since = 0.0
+    if phase == "needs_human":
+        try:
+            since = datetime.fromisoformat(str((st.get("halt") or {}).get("at") or "")).timestamp()
+        except (TypeError, ValueError):
+            since = 0.0
+    else:
+        since = float(st.get("waiting_since") or 0.0)
+    since = since or float(st.get("state_updated_at") or 0.0)
+    if since <= 0:
+        return None
+    return {"phase": phase, "since": since, "min": max(0, int((now - since) // 60))}
+
+
+def format_wait_age(minutes: int) -> str:
+    return f"{minutes} мин" if minutes < 120 else f"{minutes // 60} ч {minutes % 60:02d} мин"
+
+
 def cmd_status(cfg: dict, args) -> None:
     if getattr(args, "all", False):
         # precedence: --all выигрывает, --task игнорируется
@@ -5358,6 +5398,7 @@ def cmd_status(cfg: dict, args) -> None:
             "review_transport": {"stub_retries": stubs, "transport_retries": tretry,
                                  "empty_retries": empty, "reviews": len(tel)},
             "guard": {"executor_deny": deny, "resources": res_state},
+            "waiting": waiting_info(st),
             "state": st,
         }, ensure_ascii=False, indent=2, default=str))
         return
@@ -5395,6 +5436,17 @@ def cmd_status(cfg: dict, args) -> None:
     if info.get("halt"):
         h = info["halt"]
         print(f"остановка: kind={h.get('kind')} phase={h.get('phase')} resumable={h.get('resumable')} — {info['stop_reason']}")
+    wait = waiting_info(st)
+    if wait and (wait["phase"] != "done" or wait["min"] < 24 * 60):     # давно закрытые серии не шумим
+        age = format_wait_age(wait["min"])
+        if wait["phase"] == "impl_pending":
+            print(f"ЖДЁТ ВАС {age}: план принят, имплементация сама НЕ стартует — после чтения плана "
+                  f"`duo run --task {args.task} --continue`")
+        elif wait["phase"] == "needs_human":
+            print(f"ЖДЁТ ВАС {age}: остановка требует решения человека (см. строку «остановка» выше)")
+        else:
+            print(f"ЗАВЕРШЕНА {age} назад: серия сама больше ничего не делает — дальше ваши шаги "
+                  f"(`gates`, `accept`, `commit-by-plan`, `merge`)")
     if summ and st.get("phase") in ("impl_pending", "impl", "done"):
         print(f"принято: {summ}")
         if st.get("phase") == "impl_pending":
@@ -5440,7 +5492,9 @@ def cmd_accept(cfg: dict, args) -> int:
         say(f"ПРИЁМКА (dry-run): серия {args.task}, дерево {p.work_path}, ресурсы: {', '.join(names) or '—'}")
         for s in steps:
             say(f"  шаг {s['name']}: {' '.join(s['argv'])}  (таймаут {s['timeout_sec']:g} с"
-                + (f"; rc={s['inconclusive_rc']} = INCONCLUSIVE" if s["inconclusive_rc"] is not None else "") + ")")
+                + (f"; rc={s['inconclusive_rc']} = INCONCLUSIVE" if s["inconclusive_rc"] is not None else "")
+                + (f"; вывод ~ /{s['inconclusive_match']}/ = INCONCLUSIVE" if s.get("inconclusive_match") else "")
+                + ")")
         if as_json:
             print(json.dumps({"task": args.task, "dry_run": True, "cwd": str(p.work_path), "resources": names,
                               "steps": steps}, ensure_ascii=False, indent=2))
@@ -5565,6 +5619,15 @@ def _supervisor_load(path: Path) -> dict:
         return {}
 
 
+def phase_event_key(info: dict) -> str:
+    """Ключ события «done / impl_pending» для надзора: отпечаток того, что реально произошло (фаза,
+    потрачено в центах, версии плана и кода), а НЕ `state_updated_at`. Heartbeat обновляется любой записью
+    state — в т.ч. `duo accept` и `hold` после завершения; прежний ключ слал «ГОТОВО» заново после каждой
+    такой записи (журнал надзора 20.11.2026: 2–4 одинаковых уведомления на серию)."""
+    cents = int(round(float(info.get("spent_usd") or 0.0) * 100))
+    return f"{info['phase']}:{cents}:{info.get('plan_version', 0)}:{info.get('impl_version', 0)}"
+
+
 def supervise_tick(cfg: dict, *, auto_resume: bool | None = None, now: float | None = None,
                    state_path: Path | None = None, spawn=None, notify=None, dry_run: bool = False) -> list[dict]:
     """Один тик надзора (stateless между запусками; для systemd-timer / cron). Состояние
@@ -5600,10 +5663,15 @@ def supervise_tick(cfg: dict, *, auto_resume: bool | None = None, now: float | N
         rec = sstate.setdefault(skey, {})
         if info["kind"] == "done" or (info["kind"] == "idle" and info["phase"] == "impl_pending"):
             # событие «серия завершена / план принят»: один раз, только свежее (≤ 1 ч)
-            ev = f"{info['phase']}:{int(info.get('updated_at', 0))}"
-            if rec.get("noticed") != ev:
+            ev = phase_event_key(info)
+            prev = rec.get("noticed")
+            if prev != ev:
                 rec["noticed"] = ev
-                if not baseline and info.get("age_sec", 1e9) <= 3600:
+                # прежний формат ключа — `<фаза>:<heartbeat>` (одно число): то же событие уже отмечено, молча
+                # переписываем ключ — иначе первый тик после обновления инструмента шлёт повтор по каждой
+                # свежей серии (так случилось на рабочей машине при выкладке 20.11.2026)
+                migrated = isinstance(prev, str) and re.fullmatch(re.escape(info["phase"]) + r":\d+", prev) is not None
+                if not baseline and not migrated and info.get("age_sec", 1e9) <= 3600:
                     label = ("ГОТОВО (impl принят)" if info["phase"] == "done"
                              else "план принят — ждёт запуска имплементации")
                     act = {"task": task, "project": project, "kind": info["phase"], "action": "notice",
@@ -6760,7 +6828,11 @@ def main() -> None:
         sys.path.insert(0, str(SCRIPT_DIR))
         from audit_cmd import cmd_audit
         pl = Pipeline(cfg, args.task)
-        sys.exit(cmd_audit(cfg, args, pl.task_dir, pl.work_path, pl.load_state()))
+        ast = pl.load_state()
+        aud_zones = (cfg.get("audit") or {}).get("write_zones") if isinstance(cfg.get("audit"), dict) else None
+        want_plan = isinstance(aud_zones, list) and any(str(z).strip() == "@plan" for z in aud_zones)
+        plan_zone = pl._zone_from_plan(ast)[0] if want_plan else None      # токен `@plan` (Н31)
+        sys.exit(cmd_audit(cfg, args, pl.task_dir, pl.work_path, ast, plan_zone))
 
 
 if __name__ == "__main__":

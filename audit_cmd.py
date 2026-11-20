@@ -17,6 +17,7 @@
 
 from __future__ import annotations
 
+import fnmatch
 import gzip
 import json
 import os
@@ -61,10 +62,19 @@ def find_session_files(config_dir: Path, ids: list[str]) -> tuple[list[tuple[str
     return found, missing
 
 
-def compile_rules(cfg_audit: dict, task: str) -> dict:
+PLAN_ZONE_TOKEN = "@plan"
+
+
+def compile_rules(cfg_audit: dict, task: str, plan_zone: list[str] | None = None) -> dict:
     """Правила из `audit` конфига: regex-списки (deny_bash — по тексту Bash-команд; deny_read — по путям
-    Read; deny_script — по ТЕЛУ записанных .py/.sh) и write_zones (каталоги записи, `{task}` подставляется)."""
-    out: dict = {"deny_bash": [], "deny_read": [], "deny_script": [], "write_zones": []}
+    Read; deny_script — по ТЕЛУ записанных .py/.sh) и write_zones (каталоги записи, `{task}` подставляется).
+
+    Токен `@plan` в write_zones (Н31) — «зона записи, заявленная принятым планом» (`## files_touch`: файлы,
+    каталоги, globs). `plan_zone` — раскрытый вызывающим список (None — плана с такой секцией нет: solo,
+    серия до принятия плана); тогда токен ничего не добавляет, а `plan_unresolved` честно говорит об этом.
+    Проект-широкая зона (`src/`) для кодовой серии слишком грубая: запись в чужой модуль проходила бы."""
+    out: dict = {"deny_bash": [], "deny_read": [], "deny_script": [], "write_zones": [],
+                 "plan_zone": [], "plan_requested": False, "plan_unresolved": False}
     cfg_audit = {} if cfg_audit is None else cfg_audit
     if not isinstance(cfg_audit, dict):
         raise AuditConfigError("audit должен быть объектом {deny_bash, deny_read, deny_script, write_zones}")
@@ -80,7 +90,15 @@ def compile_rules(cfg_audit: dict, task: str) -> dict:
     zones = (cfg_audit or {}).get("write_zones") or []
     if not isinstance(zones, list):
         raise AuditConfigError("audit.write_zones должен быть списком каталогов")
-    out["write_zones"] = [os.path.normpath(str(z).replace("{task}", task)) for z in zones]
+    out["plan_requested"] = any(str(z).strip() == PLAN_ZONE_TOKEN for z in zones)
+    out["write_zones"] = [os.path.normpath(str(z).replace("{task}", task)) for z in zones
+                          if str(z).strip() != PLAN_ZONE_TOKEN]
+    if out["plan_requested"]:
+        out["plan_unresolved"] = plan_zone is None
+        out["plan_zone"] = list(plan_zone or [])
+    # проверка записи включена, если есть статические зоны либо `@plan` раскрыт (даже в пустой список:
+    # «план заявил, что ничего не пишем» — тогда любая запись вне статических зон нарушение)
+    out["zone_active"] = bool(out["write_zones"]) or (out["plan_requested"] and not out["plan_unresolved"])
     return out
 
 
@@ -93,15 +111,18 @@ def _local_time(ts: str | None) -> str:
         return "—"
 
 
-def _zone_verdict(path: str, root: Path, zones: list[str]) -> str | None:
-    """None — запись в разрешённой зоне; иначе краткая причина."""
+def _zone_verdict(path: str, root: Path, zones: list[str], plan_zone: list[str] | tuple = ()) -> str | None:
+    """None — запись в разрешённой зоне; иначе краткая причина. `plan_zone` — пути/globs из плана
+    (точное совпадение или fnmatch от корня дерева серии; `dir/*` пересекает `/`)."""
     absolute = path if os.path.isabs(path) else os.path.join(str(root), path)
     rel = os.path.relpath(os.path.normpath(absolute), str(root))
     if rel == ".." or rel.startswith(".." + os.sep):
         return "вне дерева серии"
     if any(rel == z or rel.startswith(z + os.sep) for z in zones):
         return None
-    return "вне write_zones"
+    if any(rel == z or fnmatch.fnmatch(rel, z) for z in plan_zone):
+        return None
+    return "вне write_zones" if not plan_zone else "вне write_zones и зоны плана"
 
 
 def _written_text(name: str, inp: dict) -> str:
@@ -160,8 +181,8 @@ def audit_files(files: list[tuple[str, Path]], rules: dict, root: Path) -> dict:
                                 hit("read", rx.pattern, fp)
                     elif name in WRITE_TOOLS:
                         fp = str(inp.get(WRITE_TOOLS[name]) or "")
-                        if rules["write_zones"] and fp:
-                            why = _zone_verdict(fp, root, rules["write_zones"])
+                        if rules.get("zone_active", bool(rules["write_zones"])) and fp:
+                            why = _zone_verdict(fp, root, rules["write_zones"], rules.get("plan_zone") or ())
                             if why:
                                 hit("write", why, fp)
                         if rules["deny_script"] and fp.endswith(SCRIPT_EXT):
@@ -189,8 +210,10 @@ def archive_sessions(task_dir: Path, files: list[tuple[str, Path]]) -> list[Path
     return written
 
 
-def cmd_audit(cfg: dict, args, task_dir: Path, work_root: Path, state: dict) -> int:
-    """Диспетчер: `duo audit --task X [--json] [--archive]`. Пути/state резолвит вызывающий (Pipeline)."""
+def cmd_audit(cfg: dict, args, task_dir: Path, work_root: Path, state: dict,
+              plan_zone: list[str] | None = None) -> int:
+    """Диспетчер: `duo audit --task X [--json] [--archive]`. Пути/state резолвит вызывающий (Pipeline);
+    `plan_zone` — зона из `## files_touch` принятого плана для токена `@plan` (None — нет)."""
     task = args.task
     as_json = bool(getattr(args, "json", False))
 
@@ -202,11 +225,12 @@ def cmd_audit(cfg: dict, args, task_dir: Path, work_root: Path, state: dict) -> 
         return obj["rc"]
 
     try:
-        rules = compile_rules(cfg.get("audit"), task)
+        rules = compile_rules(cfg.get("audit"), task, plan_zone)
     except AuditConfigError as e:
         return finish({"task": task, "rc": 2, "error": str(e)}, [f"аудит невозможен: {e}"])
-    counts = {k: len(v) for k, v in rules.items()}
-    checked = any(counts.values())
+    counts = {k: len(rules[k]) for k in ("deny_bash", "deny_read", "deny_script", "write_zones")}
+    counts["write_zones"] += len(rules["plan_zone"])
+    checked = any(counts.values()) or rules["zone_active"]
     ids = session_ids(state)
     files, missing = find_session_files(Path(cfg["claude_config_dir"]), ids)
     if not files:
@@ -223,6 +247,7 @@ def cmd_audit(cfg: dict, args, task_dir: Path, work_root: Path, state: dict) -> 
     rc = 1 if findings else 0
     obj = {"task": task, "rc": rc, "checked": checked, "rules": counts,
            "sessions": [{"id": sid, "path": str(p), "bytes": p.stat().st_size} for sid, p in files],
+           "plan_zone": (rules["plan_zone"] if rules["plan_requested"] and not rules["plan_unresolved"] else None),
            "missing": missing, "events": res["events"], "tools": res["tools"],
            "findings": findings, "archived": archived}
     mb = sum(p.stat().st_size for _, p in files) / 1e6
@@ -231,7 +256,12 @@ def cmd_audit(cfg: dict, args, task_dir: Path, work_root: Path, state: dict) -> 
              f"сессии: {len(files)} ({', '.join(sid[:8] + '…' for sid, _ in files)}; {mb:.1f} МБ)"
              + (f"; журнал не найден для: {', '.join(m[:8] + '…' for m in missing)}" if missing else ""),
              f"вызовов инструментов: {res['events']} — {tools_txt}",
-             "правила: " + " ".join(f"{k}={v}" for k, v in counts.items())]
+             "правила: " + " ".join(f"{k}={v}" for k, v in counts.items())
+             + (f" (в т.ч. из плана {len(rules['plan_zone'])})" if rules["plan_zone"] else "")]
+    if rules["plan_unresolved"]:
+        lines.append("write_zones: `@plan` НЕ раскрыт — у серии нет принятого плана с секцией `## files_touch` "
+                     "(solo / план без секции): вклад плана в зону пуст, действуют только статические зоны"
+                     + ("" if rules["zone_active"] else "; запись НЕ проверялась"))
     if not checked:
         lines.append("правил нет (`audit` в .duo/config.json пуст): нарушения НЕ проверялись, только счётчики")
     lines.append(f"НАРУШЕНИЙ: {len(findings)}")

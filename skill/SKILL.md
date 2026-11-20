@@ -18,6 +18,22 @@ description: Запуск и управление duo-пайплайном (ис
 `duo --repo /путь/к/проекту run --task NAME` (`--repo` — глобальный флаг, ставится
 ДО подкоманды; после неё argparse его не примет).
 
+## СТОРОЖА — не пропусти конец фазы (читай до первого `run`)
+
+Серия идёт в фоне, а конец фазы **тихий**: «план принят» (`impl_pending`) и «код принят» (`done`) никто не
+объявит, пока ты не следишь; `impl_pending` сам не стартует. В полевых отчётах оператор не раз пропускал конец
+фазы — серия стояла по 17–20 минут впустую.
+
+- **Сразу после КАЖДОГО `duo run` / `duo run --continue`** (в ту же минуту, не «потом») запусти сторожа В ФОНЕ:
+  `duo wait --task NAME --timeout 3600 --quiet` с `notify_on_output` по `WAIT-RESULT`. Итог:
+  `WAIT-RESULT: done | impl_pending | halted | dead | idle | timeout` — на любой из них реагируй сразу
+  (`impl_pending` → читай план и решай про `--continue`; `done` → `gates`/`audit`/`accept`; `halted`/`dead` → `status`).
+- `nohup … > файл &` без чтения файла **молчит**: сторож, которого никто не читает, не сторож.
+- Страховка — надзор (`duo-supervise.timer`): уведомление рабочего стола, если проект подключён (`duo projects`).
+  Его след — не `orchestrator.log`, а `journalctl --user -u duo-supervise.service | grep SUPERVISE`.
+- Потерял сторожа (рестарт сессии, обрыв ssh) или вернулся из паузы: `duo status --task NAME` — строки
+  `ЖДЁТ ВАС N мин` / `ЗАВЕРШЕНА N мин назад`.
+
 ## Режимы
 
 | режим | кто | стадии | вызовов модели на итерацию ревью | когда брать |
@@ -48,10 +64,10 @@ duo init --task NAME --mode pair [--worktree]   # создаёт pipeline/NAME/{
                                                 # (готовое задание: --task-file ФАЙЛ; режим solo: init без --mode)
 # написать задание в pipeline/NAME/task.md (см. «Как писать задание»)
 duo run --task NAME                             # стадия «план», detached
-duo wait --task NAME --timeout 3600 --quiet     # блокирует до остановки/приёмки: WAIT-RESULT: …
+duo wait --task NAME --timeout 3600 --quiet     # СТОРОЖ, В ФОНЕ, сразу после run (см. блок выше); WAIT-RESULT: …
 # прочитать plan_vN.md и revNNN_plan.md; если план годится:
 duo run --task NAME --continue                  # стадия «код»
-duo wait --task NAME --timeout 7200 --quiet
+duo wait --task NAME --timeout 7200 --quiet     # снова сторож: конец «кода» тоже тихий
 duo gates --task NAME [--dirty]                 # гейты в чистой копии (если настроены gates.steps);
                                                 # серия не закоммичена → без --dirty проверится бейзлайн HEAD (будет ВНИМАНИЕ)
 duo commit-by-plan --task NAME --dry-run        # read-only: «предсказание для --yes: пройдёт/ОТКАЖЕТ — причины»

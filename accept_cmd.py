@@ -15,13 +15,17 @@
     оборудовании, решает человек.
 
 Вердикт шага: rc 0 — PASS; rc == `inconclusive_rc` — INCONCLUSIVE (устройство недоступно — не провал);
-иначе FAIL. Таймаут и «не удалось запустить» — INCONCLUSIVE (проверка не состоялась, дефекта не нашли).
+rc != 0 и вывод шага (stdout+stderr) подходит под regex `inconclusive_match` — тоже INCONCLUSIVE (Н32: проверяемая
+команда проекта не всегда различает «устройство/сеть недоступны» и «дефект» кодом возврата — оба раза rc=1;
+правильный способ — разный rc в самой команде и `inconclusive_rc`, а regex — когда команду не поменять;
+совпадение никогда не даёт PASS, а его причина пишется в результат); иначе FAIL. Таймаут и «не удалось запустить» — INCONCLUSIVE (проверка не состоялась, дефекта не нашли).
 Итог: любой FAIL → FAIL; иначе любой INCONCLUSIVE → INCONCLUSIVE; иначе PASS.
 Коды выхода: 0 PASS, 1 FAIL, 2 INCONCLUSIVE либо приёмка не настроена/отказ (как `gates` на пустых шагах).
 """
 
 from __future__ import annotations
 
+import re
 import subprocess
 import time
 from collections.abc import Callable
@@ -56,12 +60,22 @@ def validate_steps(cfg_acc) -> tuple[list[dict], list[str]]:
         if inc is not None and (isinstance(inc, bool) or not isinstance(inc, int) or inc == 0):
             problems.append(f"{tag}: inconclusive_rc — целое, отличное от 0 (rc, означающий «устройство недоступно»)")
             continue
+        pat = s.get("inconclusive_match")
+        if pat is not None:
+            if not isinstance(pat, str) or not pat:
+                problems.append(f"{tag}: inconclusive_match — непустая строка-regex")
+                continue
+            try:
+                re.compile(pat)
+            except re.error as e:
+                problems.append(f"{tag}: inconclusive_match — некорректный regex {pat!r}: {e}")
+                continue
         to = s.get("timeout_sec", DEFAULT_TIMEOUT_SEC)
         if isinstance(to, bool) or not isinstance(to, (int, float)) or to <= 0:
             problems.append(f"{tag}: timeout_sec — положительное число секунд")
             continue
         steps.append({"name": str(s.get("name") or f"step{i}"), "argv": list(argv),
-                      "inconclusive_rc": inc, "timeout_sec": float(to)})
+                      "inconclusive_rc": inc, "inconclusive_match": pat, "timeout_sec": float(to)})
     return steps, problems
 
 
@@ -90,6 +104,8 @@ def run_steps(steps: list[dict], *, cwd, env: dict, runner: Callable | None = No
             verdict = "PASS"
         elif st["inconclusive_rc"] is not None and rc == st["inconclusive_rc"]:
             verdict, why = "INCONCLUSIVE", "устройство недоступно (inconclusive_rc шага)"
+        elif st.get("inconclusive_match") and re.search(st["inconclusive_match"], text):
+            verdict, why = "INCONCLUSIVE", f"вывод подошёл под inconclusive_match: {st['inconclusive_match']}"
         else:
             verdict = "FAIL"
         lines = text.strip().splitlines()

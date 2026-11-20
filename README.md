@@ -7,6 +7,13 @@
 Единый источник истины: код, конфиг по умолчанию, шпаргалки и скилл лежат здесь; проект
 хранит у себя только `pipeline/<task>/` (артефакты серий) и необязательный `.duo/config.json`.
 
+## Не пропусти конец фазы
+
+Серия идёт в фоне, а её конец (план принят / код принят / остановка) **тихий**. Сразу после каждого
+`duo run` и `duo run --continue` запускайте сторожа В ФОНЕ: `duo wait --task NAME --timeout 3600 --quiet`
+(агенту — с `notify_on_output` по `WAIT-RESULT`). Подробно — раздел «СТОРОЖА» в
+[docs/CHEATSHEET-CONTROL.md](docs/CHEATSHEET-CONTROL.md).
+
 ## Требования
 
 Linux, Python ≥ 3.11 (только stdlib), git, [Claude Code CLI](https://docs.claude.com/en/docs/claude-code)
