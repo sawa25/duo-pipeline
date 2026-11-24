@@ -106,7 +106,7 @@ class ScriptedTransport:
         self.costs = list(costs or [])
         self.calls: list[str] = []
 
-    def call(self, prompt, *, mode, timeout=0, cwd=None, resume_session=None, tag=""):
+    def call(self, prompt, *, mode, timeout=0, cwd=None, resume_session=None, tag="", **_kw):
         self.calls.append(prompt)
         if self.responses:
             resp = self.responses.pop(0)

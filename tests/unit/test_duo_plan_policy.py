@@ -45,7 +45,7 @@ class _Transport:
         self.responses = list(responses)
         self.calls: list[str] = []
 
-    def call(self, prompt, *, mode, timeout=0, cwd=None, resume_session=None, tag=""):
+    def call(self, prompt, *, mode, timeout=0, cwd=None, resume_session=None, tag="", **_kw):
         self.calls.append(prompt)
         resp = self.responses.pop(0) if self.responses else GOOD
         return resp, None, 0.1 * len(self.calls)

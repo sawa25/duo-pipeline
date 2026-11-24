@@ -61,7 +61,7 @@ class PairTransport(AcceptingTransport):
         self.verdicts = list(verdicts)
         self.reviewer_prompts: list[str] = []
 
-    def call(self, prompt, *, mode, timeout=0, cwd=None, resume_session=None, tag=""):
+    def call(self, prompt, *, mode, timeout=0, cwd=None, resume_session=None, tag="", **_kw):
         if SINGLE_MARK in prompt:
             self.reviewer_prompts.append(prompt)
             if not self.responses:
@@ -560,7 +560,7 @@ class WritingTransport(PairTransport):
         super().__init__(*a, **kw)
         self.impl_writes = list(impl_writes)
 
-    def call(self, prompt, *, mode, timeout=0, cwd=None, resume_session=None, tag=""):
+    def call(self, prompt, *, mode, timeout=0, cwd=None, resume_session=None, tag="", **_kw):
         out = super().call(prompt, mode=mode, timeout=timeout, cwd=cwd,
                            resume_session=resume_session, tag=tag)
         if mode == "full" and cwd and "ФАЗА: ИМПЛЕМЕНТАЦИЯ" in prompt:

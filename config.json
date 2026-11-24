@@ -2,7 +2,24 @@
   "artifacts_dir": "pipeline",
   "claude_config_dir": "~/.claude-glm",
   "council_agents_dir": "~/.claude/agents",
-  "model": "opus",
+  "model": "sonnet",
+  "models": {
+    "executor": "sonnet",
+    "reviewer": "opus",
+    "chairman": "sonnet",
+    "socrates2": "sonnet",
+    "_comment": "модели по ролям (Н33). Значения — АЛИАСЫ профиля CLI (~/.claude-glm/settings.json, ANTHROPIC_DEFAULT_<АЛИАС>_MODEL): opus = сильнейшая модель стенда (glm-5.4), sonnet = средняя (glm-5.3), haiku = дешёвая (glm-5.3-flash). executor — исполнитель (одна сессия на серию, закрепляется в state.executor_model; на серию — `run --executor-model ALIAS`); reviewer — участники дуэта и единственный проверяющий pair (проверка кода/плана: feynman2, torvalds2, meadows2 — на сильнейшей); ключ с именем персоны (socrates2) переопределяет reviewer для неё (диалектика/необходимость — не проверка кода, 5.3 достаточно и даёт разнообразие моделей); chairman — председатель и эскалация (свод/триаж). Роль без записи берёт `model`. Тяжёлый проект: `models.executor: opus` в .duo/config.json"
+  },
+  "effort": {
+    "opus": "high",
+    "_comment": "--effort по АЛИАСУ модели (low|medium|high|xhigh|max); без записи флаг не передаётся. У glm-5.4 дефолт CLI — max: по сторонним замерам (KingBench 4) он на max примерно в 4 раза медленнее glm-5.3 и долго «думает молча»; high — рабочий компромисс ревью (не откалиброван на живых сериях — см. docs/FIELD-TEST-BRIEF.md §4.6). `max` — точечно (большой дифф, спорная архитектура) через .duo/config.json"
+  },
+  "model_expect": {
+    "opus": "glm-5.4",
+    "sonnet": "glm-5.3",
+    "haiku": "glm-5.3-flash",
+    "_comment": "что ожидается за алиасами в профиле стенда; расхождение — ВНИМАНИЕ в журнале запуска и в selftest (профиль AMD и NVIDIA обновляются отдельно, а один config.json на оба). Только предупреждение"
+  },
   "duo": {
     "members_plan": [
       "socrates2",
@@ -36,7 +53,7 @@
   },
   "timeouts": {
     "executor_sec": 1200,
-    "reviewer_sec": 420,
+    "reviewer_sec": 900,
     "chairman_sec": 600,
     "ping_sec": 60,
     "api_retry_wait_sec": 30,
@@ -61,9 +78,9 @@
   },
   "auto_proceed_to_impl": false,
   "solo": {
-    "model": "sonnet",
+    "model": "haiku",
     "max_turns": 24,
-    "_comment": "solo-режим (run --solo): один исполнитель без план-фазы и дуо-ревью; model — алиас claude (sonnet -> glm-5.3-flash); max_turns — предел вызовов-продолжений до маркера SOLO_DONE"
+    "_comment": "solo-режим (run --solo): один исполнитель без план-фазы и дуо-ревью; model — алиас claude (haiku -> glm-5.3-flash); max_turns — предел вызовов-продолжений до маркера SOLO_DONE"
   },
   "executor_env_hint": "",
   "supervisor": {

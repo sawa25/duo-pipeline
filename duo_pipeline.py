@@ -2,13 +2,13 @@
 """
 duo_pipeline.py — оркестратор пайплайна «исполнитель ↔ дуо-консилиум».
 
-Исполнитель      : агентская сессия claude-glm (glm-5.3 через Z.AI), полные права,
+Исполнитель      : агентская сессия claude-glm (модель роли — `models.executor`, Z.AI), полные права,
                    персистентность через --resume.
 Надсмотрщик      : дуо-консилиум (2 council-персоны, полярная пара) по механике
                    скилла ~/.claude/skills/council: R1 вслепую -> R2 перекрёстный
                    допрос (анти-конформизм) -> R3 финальные позиции (STANCE) ->
                    председатель синтезирует revNNN.md с машинным VERDICT.
-Все вызовы GLM 5.3 через ключ Z.AI (профиль ~/.claude-glm). Подписка Cursor
+Все вызовы GLM через ключ Z.AI (профиль ~/.claude-glm; модели по ролям — `models`). Подписка Cursor
 не расходуется.
 
 Режимы серии (флаг --mode / --solo; записывается в state.json при первом запуске):
@@ -135,7 +135,17 @@ DEFAULTS = {
     "artifacts_dir": "pipeline",
     "claude_config_dir": "~/.claude-glm",           # ~ и $VAR раскрываются в load_config
     "council_agents_dir": "~/.claude/agents",
-    "model": "opus",                    # алиас -> ANTHROPIC_DEFAULT_OPUS_MODEL=glm-5.3
+    # Н33 (выход glm-5.4): алиасы профиля CLI — сильнейшая/средняя/дешёвая модель стенда:
+    # opus -> glm-5.4, sonnet -> glm-5.3, haiku -> glm-5.3-flash (ANTHROPIC_DEFAULT_<АЛИАС>_MODEL).
+    "model": "sonnet",                  # запасной алиас для роли без записи в models
+    "models": {
+        "executor": "sonnet",           # одна сессия на серию; закрепляется в state.executor_model
+        "reviewer": "opus",             # feynman2/torvalds2/meadows2 — сильнейшая модель
+        "chairman": "sonnet",           # свод и триаж — средняя; другая модель, чем у ревьюеров
+        "socrates2": "sonnet",          # персона-исключение: диалектика, не проверка кода
+    },
+    "effort": {"opus": "high"},         # --effort по АЛИАСУ; у 5.4 дефолт CLI — max (очень медленно)
+    "model_expect": {"opus": "glm-5.4", "sonnet": "glm-5.3", "haiku": "glm-5.3-flash"},
     "duo": {
         # персоны «2» (триаж блокер/эррата для plan; impl-триаж и динамика для impl) — по умолчанию;
         # оригиналы socrates/feynman/torvalds/meadows (для /council) не тронуты — `members_*` в config.json
@@ -186,7 +196,7 @@ DEFAULTS = {
     },
     "timeouts": {
         "executor_sec": 600,
-        "reviewer_sec": 420,
+        "reviewer_sec": 900,            # idle-лимит; 5.4 думает молча дольше 5.3 (Н33)
         "chairman_sec": 600,
         "ping_sec": 60,
         "api_retry_wait_sec": 30,       # база экспоненциальной паузы перед повтором (×2, потолок 240)
@@ -312,6 +322,21 @@ def guard_config_problems(cfg: dict) -> list[str]:
                     re.compile(str(pat))
                 except re.error as e:
                     bad.append(f"audit.{k}: некорректный regex {pat!r}: {e}")
+    # Н33: models/effort/model_expect — опечатка не должна превращаться в тихое «роль на запасной модели»
+    for key in ("models", "effort", "model_expect"):
+        sec = cfg.get(key)
+        if sec is None:
+            continue
+        if not isinstance(sec, dict):
+            bad.append(f"{key} должен быть объектом")
+            continue
+        for k, v in sec.items():
+            if str(k).startswith("_"):
+                continue                                    # «_comment» и т.п.
+            if not isinstance(v, str) or not v.strip():
+                bad.append(f"{key}.{k}: пустое/нестроковое значение {v!r}")
+            elif key == "effort" and v not in EFFORT_LEVELS:
+                bad.append(f"effort.{k}: уровень {v!r} неизвестен (допустимы {', '.join(EFFORT_LEVELS)})")
     return bad
 
 
@@ -409,19 +434,95 @@ def release_resources(fds: list[int]) -> None:
             pass
 
 
-def model_label(cfg: dict, alias: str | None = None) -> str:
-    """Н29: в логе — не только алиас (`sonnet`), но и во что он отображается в профиле CLI
-    (`ANTHROPIC_DEFAULT_<АЛИАС>_MODEL` из `<claude_config_dir>/settings.json`: sonnet → glm-5.3-flash).
-    Читается ТОЛЬКО эта переменная: рядом в settings.json лежат токены — их в лог не тащим."""
-    alias = alias or str(cfg.get("model") or "?")
+def profile_model(cfg: dict, alias: str) -> str | None:
+    """Во что алиас отображается в профиле CLI: `ANTHROPIC_DEFAULT_<АЛИАС>_MODEL` из
+    `<claude_config_dir>/settings.json` (например, `glm-5.4[1m]`). None — маппинга нет/файл нечитаем.
+    Читается ТОЛЬКО эта переменная: рядом в settings.json лежат токены — их наружу не тащим."""
     cdir = str(cfg.get("claude_config_dir") or "")
-    real = None
     try:
         env = (load_json(Path(cdir) / "settings.json").get("env") or {})
         real = env.get(f"ANTHROPIC_DEFAULT_{alias.upper()}_MODEL")
     except (OSError, ValueError, AttributeError):
-        pass
-    return f"{alias} → {real}" if isinstance(real, str) and real else alias
+        return None
+    return real if isinstance(real, str) and real else None
+
+
+def model_label(cfg: dict, alias: str | None = None) -> str:
+    """Н29: в логе — не только алиас (`sonnet`), но и во что он отображается в профиле CLI
+    (sonnet → glm-5.3[1m]); см. profile_model."""
+    alias = alias or str(cfg.get("model") or "?")
+    real = profile_model(cfg, alias)
+    return f"{alias} → {real}" if real else alias
+
+
+# --- модели по ролям (Н33: выход glm-5.4) ---------------------------------------------------------
+# Роли: executor (одна сессия на серию — алиас закрепляется в state.executor_model), reviewer
+# (участники дуэта R1–R3 и единственный проверяющий pair; уточнение по имени персоны), chairman
+# (председатель дуэта и эскалация). Алиасы — слои профиля CLI (opus/sonnet/haiku = сильнейшая/
+# средняя/дешёвая модель стенда); их фактическое наполнение читается из settings.json профиля и
+# сверяется с `model_expect` — расхождение стендов (AMD отстаёт от NVIDIA) видно в логе, а не молча.
+EFFORT_LEVELS = ("low", "medium", "high", "xhigh", "max")
+MODEL_ROLES = ("executor", "reviewer", "chairman")
+
+
+def role_model(cfg: dict, role: str, persona: str = "", pinned: str = "") -> str:
+    """Алиас модели для роли: pinned (закреплённый за серией исполнитель) > models[persona]
+    (только reviewer: точечное исключение, напр. socrates2) > models[role] > cfg["model"]."""
+    if pinned:
+        return pinned
+    models = cfg.get("models") if isinstance(cfg.get("models"), dict) else {}
+    if role == "reviewer" and persona and models.get(persona):
+        return str(models[persona])
+    return str(models.get(role) or cfg.get("model") or "")
+
+
+def role_effort(cfg: dict, alias: str) -> str:
+    """Уровень рассуждений для алиаса (`--effort`); "" — не передавать флаг (дефолт модели/CLI).
+    Ключ — АЛИАС модели, а не роль: эффорт — свойство «как мы запускаем эту модель», и при смене
+    роли на другой алиас он не «протекает» на модель, которая его не поддерживает."""
+    eff = cfg.get("effort") if isinstance(cfg.get("effort"), dict) else {}
+    val = str(eff.get(alias) or "")
+    return val if val in EFFORT_LEVELS else ""
+
+
+def model_drift(cfg: dict, aliases: list[str]) -> list[str]:
+    """Расхождения «ожидаемая модель (model_expect) ↔ фактическая в профиле» для используемых алиасов.
+    Профиль — часть стенда, а не репозитория: после выхода новой модели один стенд обновили, другой
+    нет, и один и тот же config.json даёт разные модели ролям. Только предупреждения, без отказа."""
+    expect = cfg.get("model_expect") if isinstance(cfg.get("model_expect"), dict) else {}
+    out: list[str] = []
+    for alias in dict.fromkeys(aliases):
+        want = expect.get(alias)
+        real = profile_model(cfg, alias)
+        if not want or real is None:
+            continue
+        if real.split("[")[0] != str(want):
+            out.append(f"алиас {alias} → {real}, ожидалось {want}")
+    return out
+
+
+def models_summary(cfg: dict, mode: str, pinned_executor: str = "") -> list[str]:
+    """Строки «роль: алиас → модель (effort)» для лога/status/selftest — по режиму серии."""
+    def fmt(alias: str) -> str:
+        eff = role_effort(cfg, alias)
+        return model_label(cfg, alias) + (f", effort {eff}" if eff else "")
+
+    ex = pinned_executor or role_model(cfg, "executor")
+    lines = [f"исполнитель: {fmt(ex)}"]
+    if mode == "solo":
+        return lines
+    pm = cfg.get("pair") or {}
+    if mode == "pair":
+        names = [pm.get("reviewer_plan") or DEFAULTS["pair"]["reviewer_plan"],
+                 pm.get("reviewer_impl") or DEFAULTS["pair"]["reviewer_impl"]]
+    else:
+        d = cfg.get("duo") or {}
+        names = list(d.get("members_plan") or []) + list(d.get("members_impl") or [])
+    for name in dict.fromkeys(names):
+        lines.append(f"ревьюер {name}: {fmt(role_model(cfg, 'reviewer', name))}")
+    if mode == "duo":
+        lines.append(f"председатель: {fmt(role_model(cfg, 'chairman'))}")
+    return lines
 
 
 @contextlib.contextmanager
@@ -657,7 +758,7 @@ def _remove_path(p: Path) -> None:
 
 
 # ----------------------------------------------------------------------------
-# Транспорт: claude CLI через профиль claude-glm (Z.AI, glm-5.3)
+# Транспорт: claude CLI через профиль claude-glm (Z.AI; модель/effort — по роли, см. role_model)
 # ----------------------------------------------------------------------------
 
 # транспорт claude: период опроса очереди и интервал пульса при молчании модели (секунды; тесты подменяют)
@@ -716,14 +817,20 @@ class ClaudeGlm:
         timeout: int = 420,                 # сейчас: минуты ТИШИНЫ, не общее время
         cwd: Path | None = None,
         tag: str = "",
+        role: str = "",                     # executor | reviewer | chairman → models[role]
+        persona: str = "",                  # имя ревьюера (socrates2…) → models[persona]
+        model: str = "",                    # явный алиас (закреплённый за серией исполнитель)
     ) -> tuple[str, str | None, float]:
         """Потоковый вызов с watchdog по неактивности.
 
         Процесс жив, пока из stream-json приходят события (tool_use, текст,
         прогресс) — независимо от суммарной длительности. Убивает только
         N минут тишины подряд (idle-таймаут). timeout теперь = секунды тишины.
-        Возвращает (text, session_id, cost_usd).
+        Модель: model > models[persona]/models[role] > cfg["model"] (Н33); `--effort` — только если
+        для алиаса задан effort в конфиге. Возвращает (text, session_id, cost_usd).
         """
+        alias = model or (role_model(self.cfg, role, persona) if role else self.model)
+        effort = role_effort(self.cfg, alias)
         cmd = ["claude", "-p"]
         deny = executor_deny_rules(self.cfg) if mode == "full" else []
         if deny:
@@ -731,7 +838,10 @@ class ClaudeGlm:
             # позиционный промпт (он добавляется в конец). Здесь за ней всегда идёт `--model` — порядок
             # не менять (закреплено тестом test_executor_deny_flag_is_followed_by_a_flag).
             cmd += ["--disallowedTools", ",".join(deny)]
-        cmd += ["--model", self.model, "--output-format", "stream-json", "--verbose"]
+        cmd += ["--model", alias]
+        if effort:
+            cmd += ["--effort", effort]
+        cmd += ["--output-format", "stream-json", "--verbose"]
         if mode == "plan":
             cmd += ["--permission-mode", "plan"]
         else:
@@ -1740,7 +1850,7 @@ class DuoReviewer:
         return ((not text or not text.strip()) or bool(REVIEWER_STUB_RE.search(text))
                 or is_api_error_text(text))
 
-    def _reviewer_call(self, prompt: str, tag: str) -> tuple[str, float, str]:
+    def _reviewer_call(self, prompt: str, tag: str, persona: str = "") -> tuple[str, float, str]:
         """Вызов ревьюера с одним ретраем на ответ-заглушку.
 
         Возвращает (text, суммарная_стоимость, фактический_промпт); провальная
@@ -1749,7 +1859,8 @@ class DuoReviewer:
         (parse_stance даст abstain) — без каскада ретраев."""
         timeout = self.cfg["timeouts"]["reviewer_sec"]
         text, _, cost = self._transport_retry(
-            lambda: self.t.call(prompt, mode="plan", timeout=timeout, cwd=self.repo), tag)
+            lambda: self.t.call(prompt, mode="plan", timeout=timeout, cwd=self.repo,
+                                role="reviewer", persona=persona), tag)
         if not self._is_stub_response(text):
             return text, cost, prompt
         log(self.task_dir, f"ВНИМАНИЕ: ответ {tag} — заглушка (ExitPlanMode/пусто/API Error) — ретрай с уточнением")
@@ -1757,7 +1868,8 @@ class DuoReviewer:
         self._save_tr(f"{tag}_attempt1", prompt, text, cost)
         retry_prompt = prompt + REVIEWER_STUB_RETRY_SUFFIX
         text2, _, cost2 = self._transport_retry(
-            lambda: self.t.call(retry_prompt, mode="plan", timeout=timeout, cwd=self.repo), tag)
+            lambda: self.t.call(retry_prompt, mode="plan", timeout=timeout, cwd=self.repo,
+                                role="reviewer", persona=persona), tag)
         return text2, cost + cost2, retry_prompt
 
     def _transport_retry(self, fn, what: str):
@@ -1791,19 +1903,23 @@ class DuoReviewer:
             encoding="utf-8",
         )
 
-    def _call_chairman_once(self, prompt: str, timeout: int) -> tuple[str, float]:
-        """Один вызов председателя; при сбое/таймауте — ретрай с удвоенным таймаутом."""
+    def _call_chairman_once(self, prompt: str, timeout: int, persona: str = "") -> tuple[str, float]:
+        """Один вызов председателя (persona — единственный проверяющий pair: роль reviewer, модель
+        по его имени); при сбое/таймауте — ретрай с удвоенным таймаутом."""
+        role = "reviewer" if persona else "chairman"
         try:
-            report, _, cost = self.t.call(prompt, mode="plan", timeout=timeout, cwd=self.repo)
+            report, _, cost = self.t.call(prompt, mode="plan", timeout=timeout, cwd=self.repo,
+                                          role=role, persona=persona)
             return report, cost
         except RuntimeError:
             log(self.task_dir, "председатель: сбой/таймаут — ретрай с удвоенным таймаутом")
             report, _, cost = self._transport_retry(
-                lambda: self.t.call(prompt, mode="plan", timeout=timeout * 2, cwd=self.repo), "chairman")
+                lambda: self.t.call(prompt, mode="plan", timeout=timeout * 2, cwd=self.repo,
+                                    role=role, persona=persona), "chairman")
             return report, cost
 
     def _chairman_with_retry(self, chairman_prompt: str, *, tag: str = "chairman",
-                             who: str = "председатель") -> tuple[str, float, str]:
+                             who: str = "председатель", persona: str = "") -> tuple[str, float, str]:
         """Председатель: до CHAIRMAN_MAX_ATTEMPTS попыток (chmguard R3).
 
         tag/who (режим pair): тот же контракт «валидный rev-отчёт с VERDICT» нужен и единственному
@@ -1824,7 +1940,10 @@ class DuoReviewer:
         prompt = chairman_prompt
         report = ""
         for n in range(1, CHAIRMAN_MAX_ATTEMPTS + 1):
-            report, cost = self._call_chairman_once(prompt, self.cfg["timeouts"]["chairman_sec"])
+            # pair: единственный проверяющий — читатель артефакта, а не сводящий отчёты председатель;
+            # его idle-лимит — reviewer_sec (на glm-5.4 длинное «молчаливое» мышление)
+            tmo = self.cfg["timeouts"]["reviewer_sec" if persona else "chairman_sec"]
+            report, cost = self._call_chairman_once(prompt, tmo, persona=persona)
             total_cost += cost
             # chmguard R4: сначала санирайзер преамбулы — большинство
             # «дегенеративных» ответов были валидными отчётами с лишней
@@ -1924,7 +2043,7 @@ CONFIDENCE: high | med | low
 {READ_MANIFEST_INSTR}
 
 Лимит: 400 слов."""
-        text, cost, prompt = self._reviewer_call(prompt, f"r1_{member['name']}")
+        text, cost, prompt = self._reviewer_call(prompt, f"r1_{member['name']}", persona=member["name"])
         self._acc(cost)
         self._save_tr(f"r1_{member['name']}", prompt, text, cost)
         return text
@@ -1965,7 +2084,7 @@ CONFIDENCE: high | med | low
 В конце:
 STANCE: accept | revise | abstain
 Лимит: 300 слов."""
-        text, cost, prompt = self._reviewer_call(prompt, f"r2_{member['name']}")
+        text, cost, prompt = self._reviewer_call(prompt, f"r2_{member['name']}", persona=member["name"])
         self._acc(cost)
         self._save_tr(f"r2_{member['name']}", prompt, text, cost)
         return text
@@ -1977,7 +2096,7 @@ STANCE: accept | revise | abstain
 Финальное заявление: максимум 50 слов, без новых аргументов — кристаллизация позиции.
 В конце обязателен блок:
 STANCE: accept | revise | abstain | CONFIDENCE: high|med|low"""
-        text, cost, prompt = self._reviewer_call(prompt, f"r3_{member['name']}")
+        text, cost, prompt = self._reviewer_call(prompt, f"r3_{member['name']}", persona=member["name"])
         self._acc(cost)
         self._save_tr(f"r3_{member['name']}", prompt, text, cost)
         return text
@@ -2503,7 +2622,8 @@ VERDICT: REVISE"""
         before = guard.snapshot_before_review(artifacts_rel)
         tag = f"reviewer_{member['name']}"
         self._reset_tool_stats()
-        report, cost, prompt_used = self._chairman_with_retry(prompt, tag=tag, who="проверяющий")
+        report, cost, prompt_used = self._chairman_with_retry(prompt, tag=tag, who="проверяющий",
+                                                       persona=member["name"])
         self._acc(cost)
         guard.enforce_readonly(before, artifacts_rel, self.task_dir)
         stats = self._take_tool_stats()
@@ -2520,7 +2640,8 @@ VERDICT: REVISE"""
             self._save_tr(f"{tag}_empty{empty_retries}", prompt_used, report, 0.0)
             self._reset_tool_stats()
             report, cost2, prompt_used = self._chairman_with_retry(
-                prompt + EMPTY_REVIEW_RETRY_SUFFIX.format(reason=reason), tag=tag, who="проверяющий")
+                prompt + EMPTY_REVIEW_RETRY_SUFFIX.format(reason=reason), tag=tag, who="проверяющий",
+                persona=member["name"])
             self._acc(cost2)
             cost += cost2
             guard.enforce_readonly(before, artifacts_rel, self.task_dir)
@@ -2564,11 +2685,13 @@ class Executor:
         """Один вызов исполнителя; resume сессии не удался → одна попытка в новой сессии."""
         timeout = self.cfg["timeouts"]["executor_sec"]
         try:
-            return self.t.call(prompt, mode="full", resume_session=sid, timeout=timeout, cwd=self.repo)
+            return self.t.call(prompt, mode="full", resume_session=sid, timeout=timeout, cwd=self.repo,
+                               role="executor", model=self.state.get("executor_model") or "")
         except RuntimeError as e:
             if sid and "resume" in str(e).lower():
                 log(self.task_dir, f"resume сессии не удался ({e}); пробую новую сессию")
-                return self.t.call(prompt, mode="full", timeout=timeout, cwd=self.repo)
+                return self.t.call(prompt, mode="full", timeout=timeout, cwd=self.repo,
+                                   role="executor", model=self.state.get("executor_model") or "")
             raise
 
     def _finalize(self, prompt: str, tag: str, text: str, cost: float, new_sid: str | None,
@@ -3061,8 +3184,9 @@ def find_claim_conflicts(mine: list[str], holders: list[dict], ok: list[str] | N
 
 class Pipeline:
     def __init__(self, cfg: dict, task: str, solo: bool = False, mode: str | None = None,
-                 isolation: str | None = None):
+                 isolation: str | None = None, executor_model: str | None = None):
         self.cfg = cfg
+        self.executor_model_flag = executor_model     # Н33: `run --executor-model` (алиас; пин в state)
         self.task = task
         self.repo = Path(cfg["repo"]).resolve()
         self.arts_root = self.repo / cfg["artifacts_dir"]
@@ -3083,10 +3207,10 @@ class Pipeline:
         self.mode = req
         self.solo = req == "solo"
         if self.solo:
-            # solo: исполнитель на дешёвой модели (sonnet -> glm-5.3-flash),
-            # без план-фазы и дуо-ревью; ветка не создаётся (артефактные серии)
+            # solo: исполнитель на дешёвой модели (haiku -> glm-5.3-flash; Н33: алиас — слой
+            # профиля, а не конкретная модель), без план-фазы и дуо-ревью; ветка не создаётся
             scfg = cfg.get("solo", {})
-            cfg["model"] = scfg.get("model", "sonnet")
+            cfg["model"] = scfg.get("model", "haiku")
             cfg["git"]["auto_branch"] = False
         self.t = ClaudeGlm(cfg)
         # pipev3 P2 (B1): git.isolation=worktree — серия работает в собственном
@@ -3248,7 +3372,7 @@ class Pipeline:
 Каталог артефактов серии: `{self.task_dir}` — планы/отчёты/ревью всех итераций; прочитай нужное сам.
 
 Сформулируй для человека ЕДИНСТВЕННОЕ ключевое разногласие, из-за которого цикл не сходится: в чём именно расходятся стороны (исполнитель vs ревьюеры), по каким фактам, и какие 2-3 исхода решения возможны (с последствиями каждого). Не более 200 слов. Пиши по-русски, конкретно, с координатами (файл:строки)."""
-        text, _, cost = self.t.call(prompt, mode="plan",
+        text, _, cost = self.t.call(prompt, mode="plan", role="chairman",
                                     timeout=self.cfg["timeouts"]["chairman_sec"], cwd=self.repo)
         st["spent_usd"] = round(st.get("spent_usd", 0.0) + cost, 4)
         esc_file.write_text(
@@ -3464,6 +3588,60 @@ class Pipeline:
             h = st.get("halt")
             return bool((force_continue or resume) and isinstance(h, dict) and h.get("resumable"))
         return False
+
+    def _executor_alias(self) -> str:
+        """Алиас исполнителя НОВОЙ серии: флаг > solo.model (solo) > models.executor > model."""
+        if self.executor_model_flag:
+            return self.executor_model_flag
+        if self.solo:
+            return str(self.cfg.get("model") or "")          # __init__ уже положил сюда solo.model
+        return role_model(self.cfg, "executor")
+
+    def _pin_executor_model(self, st: dict) -> None:
+        """Н33: исполнитель живёт в ОДНОЙ сессии серии (resume через план/правки/имплементацию), а смена
+        модели посреди сессии — это переход без общего контекста и без калибровки. Поэтому алиас
+        закрепляется в state.executor_model при первом запуске и дальше НЕ зависит ни от конфига, ни от
+        флагов (смену конфига/профиля подхватывают только новые серии). Серия, начатая до этой правки
+        (есть executor_session, пина нет), остаётся на алиасе, на котором работала: `opus` (duo/pair)
+        либо solo.model."""
+        want = self.executor_model_flag
+        pinned = st.get("executor_model")
+        if pinned:
+            if want and want != pinned:
+                sys.exit(f"модель исполнителя серии '{self.task}' закреплена: {pinned}; сменить на {want} нельзя "
+                         f"(одна сессия исполнителя на серию) — начни новую серию либо оставь {pinned}")
+            return
+        if want:
+            alias = want
+        elif st.get("executor_session"):
+            alias = str(self.cfg.get("model") or "") if self.solo else "opus"
+            log(self.task_dir, f"МОДЕЛЬ: серия начата до закрепления модели — исполнитель остаётся на "
+                               f"алиасе {alias}")
+        else:
+            alias = self._executor_alias()
+        st["executor_model"] = alias
+        self.save_state(st)
+
+    def log_models(self, st: dict) -> None:
+        """Строка «МОДЕЛИ» в журнал при каждом запуске: кто на какой фактической модели, плюс
+        предупреждения о расхождении профиля стенда с model_expect (Н33)."""
+        lines = models_summary(self.cfg, self.mode, st.get("executor_model") or "")
+        log(self.task_dir, "МОДЕЛИ: " + "; ".join(lines))
+        used = [st.get("executor_model") or role_model(self.cfg, "executor")]
+        if self.mode != "solo":
+            for name in self._persona_names():
+                used.append(role_model(self.cfg, "reviewer", name))
+            if self.mode == "duo":
+                used.append(role_model(self.cfg, "chairman"))
+        for w in model_drift(self.cfg, used):
+            log(self.task_dir, f"ВНИМАНИЕ: профиль моделей отличается от ожидаемого — {w}; роли работают "
+                               f"на другой модели, чем рассчитан config.json (обнови профиль CLI или `models`)")
+
+    def _persona_names(self) -> list[str]:
+        out: list[str] = []
+        for phase in ("plan", "impl"):
+            out += self._members(phase)
+        return list(dict.fromkeys(out))
 
     def _pin_mode_isolation(self, st: dict) -> None:
         """Записать режим и изоляцию серии в state: следующие запуски (--continue, --resume, сторож,
@@ -3961,6 +4139,8 @@ class Pipeline:
             # в сообщении выход `--worktree` упёрся бы в «изоляцию серии сменить нельзя»
             self._shared_parallel_guard(allow_shared_parallel)
             self._pin_mode_isolation(st)
+            self._pin_executor_model(st)
+            self.log_models(st)
         if self.isolation == "worktree":
             with repo_lock(self.repo):          # создание worktree двух серий — строго по очереди
                 self._ensure_worktree(st)       # pipev3 P2: ветка/база/provisioning worktree
@@ -3975,7 +4155,7 @@ class Pipeline:
 
         # ---- фаза SOLO (упрощённый режим: исполнитель без ревью) ----
         # pipev5 solo: до фазы PLAN — solo-задача вообще не проходит
-        # планирование (артефактные серии, модель glm-5.3-flash)
+        # планирование (артефактные серии, дешёвая модель solo.model)
         if st["phase"] == "plan" and self.solo:
             st["phase"] = "solo"
             st["solo_turn"] = st.get("solo_turn", 0)
@@ -3995,7 +4175,8 @@ class Pipeline:
                 sr.write_text(txt, encoding="utf-8")
             self.save_state(st)
             log(self.task_dir, f"SOLO: режим без план-фазы и дуо-ревью "
-                f"(модель: {model_label(self.cfg)}, профиль {self.cfg.get('claude_config_dir')}); "
+                f"(модель: {model_label(self.cfg, st.get('executor_model') or None)}, "
+                f"профиль {self.cfg.get('claude_config_dir')}); "
                 f"исполнитель выполняет task.md")
         if st["phase"] == "solo":
             ex_s = Executor(self.cfg, self.t, self.task_dir, self.work_path, st)
@@ -4673,6 +4854,7 @@ def enter_rework(p: Pipeline, st: dict, phase: str, rev_name: str, source: str,
     st.pop("inflight", None)           # ручная доработка заменяет прерванный шаг (сессия может быть новой)
     if not keep_session:
         st.pop("executor_session", None)   # свежая сессия: план/ревью/дифф исполнитель получает явно
+        st.pop("executor_model", None)     # Н33: новая сессия — модель исполнителя разрешается заново
     st["stop_reason"] = f"ручная доработка ({phase}) по {rev_name}" + (f": {note}" if note else "")
 
 
@@ -5398,6 +5580,7 @@ def cmd_status(cfg: dict, args) -> None:
             "review_transport": {"stub_retries": stubs, "transport_retries": tretry,
                                  "empty_retries": empty, "reviews": len(tel)},
             "guard": {"executor_deny": deny, "resources": res_state},
+            "models": models_summary(cfg, st.get("mode") or "duo", st.get("executor_model") or ""),
             "waiting": waiting_info(st),
             "state": st,
         }, ensure_ascii=False, indent=2, default=str))
@@ -5407,6 +5590,9 @@ def cmd_status(cfg: dict, args) -> None:
           + (f" (в т.ч. добавка серии ${extra:g})" if extra else ""))
     wt_note = (f", дерево {p.work_path}, ветка {cfg['git']['branch_prefix']}{args.task}" if wt else "")
     print(f"режим: {st.get('mode') or '— (не записан; будет duo)'}, изоляция: {p.isolation}{wt_note}")
+    pin_note = "" if st.get("executor_model") else " (модель исполнителя ещё не закреплена: по конфигу)"
+    print("модели: " + "; ".join(models_summary(cfg, st.get("mode") or "duo", st.get("executor_model") or ""))
+          + pin_note)
     if deny:
         print(f"технические запреты исполнителя (executor_deny): {len(deny)} — {', '.join(deny)[:200]}")
     else:
@@ -6422,21 +6608,34 @@ def cmd_gates(cfg: dict, args, runner: Callable | None = None) -> int:
 
 def cmd_selftest(cfg: dict, args) -> None:
     t = ClaudeGlm(cfg)
-    print(f"профиль: {cfg['claude_config_dir']}, модель-алиас: {model_label(cfg)}")
+    print(f"профиль: {cfg['claude_config_dir']}, запасной алиас: {model_label(cfg)}")
     pair_cfg = cfg.get("pair") or {}
     pair_members = [m for m in (pair_cfg.get("reviewer_plan"), pair_cfg.get("reviewer_impl")) if m]
-    for name in set(cfg["duo"]["members_plan"] + cfg["duo"]["members_impl"] + pair_members):
+    members = set(cfg["duo"]["members_plan"] + cfg["duo"]["members_impl"] + pair_members)
+    for name in sorted(members):
         m = load_member(cfg, name)
         assert m["identity"] and (m["fmt_standalone"] or m["fmt_round2"]), f"секции council-{name} не найдены"
         print(f"council-{name}: секции OK ({len(m['identity'])} симв. identity)")
-    t0 = time.time()
-    text, sid, cost = t.call(
-        "Ответь ровно одним словом: PONG", mode="plan",
-        timeout=cfg["timeouts"]["ping_sec"], cwd=Path(cfg["repo"]),
-    )
-    dt = time.time() - t0
-    print(f"транспорт: {text.strip()[:50]!r} за {dt:.1f}s, ${cost:.4f}, session={sid and sid[:8]}…")
-    assert "PONG" in text.upper(), "модель не ответила PONG"
+    # Н33: модели по ролям (режим duo — наибольший набор) и пинг КАЖДОЙ различной модели: опечатка в
+    # алиасе или отсутствие модели в профиле/подписке (напр. glm-5.4 только на Coding Plan) всплывает здесь,
+    # а не посреди серии
+    print("модели по ролям (режим duo):")
+    for ln in models_summary(cfg, "duo"):
+        print(f"  {ln}")
+    aliases = [role_model(cfg, "executor"), role_model(cfg, "chairman"),
+               *(role_model(cfg, "reviewer", n) for n in sorted(members))]
+    for w in model_drift(cfg, aliases):
+        print(f"ВНИМАНИЕ: профиль моделей отличается от ожидаемого — {w}")
+    for alias in dict.fromkeys(aliases):
+        t0 = time.time()
+        text, sid, cost = t.call(
+            "Ответь ровно одним словом: PONG", mode="plan", model=alias,
+            timeout=cfg["timeouts"]["ping_sec"], cwd=Path(cfg["repo"]),
+        )
+        dt = time.time() - t0
+        print(f"транспорт [{model_label(cfg, alias)}]: {text.strip()[:50]!r} за {dt:.1f}s, ${cost:.4f}, "
+              f"session={sid and sid[:8]}…")
+        assert "PONG" in text.upper(), f"модель {alias} не ответила PONG"
     print("SELFTEST OK")
 
 
@@ -6567,7 +6766,7 @@ def cmd_setup(cfg: dict, args, repo: Path | None) -> None:
 
 
 def main() -> None:
-    ap = argparse.ArgumentParser(description="дуо-пайплайн исполнитель↔надсмотрщик на GLM 5.3 (Z.AI)")
+    ap = argparse.ArgumentParser(description="дуо-пайплайн исполнитель↔надсмотрщик на GLM (Z.AI)")
     ap.add_argument("--config", default=str(DEFAULT_CONFIG))
     ap.add_argument("--repo", help="корень проекта (приоритет: --repo > DUO_REPO > ключ repo конфига > "
                                    "автодетект от cwd)")
@@ -6601,7 +6800,11 @@ def main() -> None:
     p.add_argument("--continue", dest="force_continue", action="store_true",
                    help="продолжить после принятия плана в имплементацию")
     p.add_argument("--solo", action="store_true",
-                   help="solo-режим: один исполнитель (glm-5.3-flash), без план-фазы и дуо-ревью")
+                   help="solo-режим: один исполнитель (алиас solo.model, по умолчанию haiku → glm-5.3-flash), "
+                        "без план-фазы и дуо-ревью")
+    p.add_argument("--executor-model", metavar="ALIAS",
+                   help="алиас модели исполнителя ЭТОЙ серии (opus|sonnet|haiku или иной алиас/имя модели профиля) "
+                        "вместо models.executor; закрепляется в state при первом запуске (одна сессия на серию)")
     p.add_argument("--resume", dest="resume", action="store_true",
                    help="pipework3: возобновить остановку с машинной записью halt (транспорт/лимит/бюджет/артефакт) "
                         "с места остановки; в отличие от --continue НЕ пересекает паузу impl_pending")
@@ -6782,7 +6985,8 @@ def main() -> None:
         if not args.fg:
             run_detached(cfg, args.task)   # pipev1 П1: detached по умолчанию
             return
-        Pipeline(cfg, args.task, mode=pins.get("mode"), isolation=pins.get("isolation")).run(
+        Pipeline(cfg, args.task, mode=pins.get("mode"), isolation=pins.get("isolation"),
+                 executor_model=getattr(args, "executor_model", None)).run(
             force_continue=args.force_continue, add_budget=args.add_budget, add_iterations=args.add_iterations,
             resume=args.resume, allow_shared_parallel=args.allow_shared_parallel,
             ignore_claims=args.ignore_claims, wait_resources=args.wait_resources)

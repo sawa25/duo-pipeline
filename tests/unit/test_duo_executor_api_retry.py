@@ -49,7 +49,7 @@ class _Transport:
         self.responses = list(responses)
         self.calls: list[dict] = []
 
-    def call(self, prompt, *, mode, timeout=0, cwd=None, resume_session=None, tag=""):
+    def call(self, prompt, *, mode, timeout=0, cwd=None, resume_session=None, tag="", **_kw):
         self.calls.append({"prompt": prompt, "mode": mode, "resume": resume_session})
         return self.responses.pop(0)
 

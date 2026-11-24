@@ -18,6 +18,8 @@
 
 Linux, Python ≥ 3.11 (только stdlib), git, [Claude Code CLI](https://docs.claude.com/en/docs/claude-code)
 (`claude`), профиль модели (по умолчанию `~/.claude-glm` — ключ `claude_config_dir`).
+Роли работают на разных моделях профиля по алиасам `opus`/`sonnet`/`haiku` (ключи `models`/`effort`/
+`model_expect` — см. «Модели по ролям» в `docs/CHEATSHEET-CONTROL.md`); `duo selftest` проверяет каждую.
 Для гейтов и `make check` — `ruff` и `pytest` в используемом интерпретаторе.
 
 ## Установка на машине

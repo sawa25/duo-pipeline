@@ -138,7 +138,7 @@ class FakeTransport:
     def __init__(self):
         self.calls: list[str] = []
 
-    def call(self, prompt, *, mode, timeout=0, cwd=None, resume_session=None, tag=""):
+    def call(self, prompt, *, mode, timeout=0, cwd=None, resume_session=None, tag="", **_kw):
         self.calls.append(prompt)
         return "ответ", "sid-1", 0.0
 

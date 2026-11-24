@@ -77,7 +77,7 @@ class FakeTransport:
         self.calls: list[tuple[str, int]] = []
         self._err_at = runtime_error_at or set()
 
-    def call(self, prompt: str, *, mode: str, timeout: int, cwd: Path | None = None):
+    def call(self, prompt: str, *, mode: str, timeout: int, cwd: Path | None = None, **_kw):
         n = len(self.calls)
         self.calls.append((prompt, timeout))
         if n in self._err_at:

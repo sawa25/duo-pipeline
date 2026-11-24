@@ -169,7 +169,7 @@ class _FailOnce(AcceptingTransport):
         self.needle = needle
         self.armed = True
 
-    def call(self, prompt, *, mode, timeout=0, cwd=None, resume_session=None, tag=""):
+    def call(self, prompt, *, mode, timeout=0, cwd=None, resume_session=None, tag="", **_kw):
         if self.armed and mode == "full" and self.needle in prompt:
             self.armed = False
             raise duo.ClaudeTransportError("idle-kill: молчание 1200с", session_id="sid-x", cost=0.5)
@@ -184,7 +184,7 @@ class _ReviseThenAccept(_FailOnce):
         super().__init__(needle)
         self.first_review_done = False
 
-    def call(self, prompt, *, mode, timeout=0, cwd=None, resume_session=None, tag=""):
+    def call(self, prompt, *, mode, timeout=0, cwd=None, resume_session=None, tag="", **_kw):
         if "Председатель консилиума" in prompt and not self.first_review_done and not self.responses:
             self.first_review_done = True
             self.responses = [CHAIR_REVISE]
@@ -342,7 +342,7 @@ class _Seq:
         self.calls: list[dict] = []
         self.write_on = write_on or {}
 
-    def call(self, prompt, *, mode, timeout=0, cwd=None, resume_session=None, tag=""):
+    def call(self, prompt, *, mode, timeout=0, cwd=None, resume_session=None, tag="", **_kw):
         i = len(self.calls)
         self.calls.append({"prompt": prompt, "resume": resume_session, "tag": tag})
         if i in self.write_on:

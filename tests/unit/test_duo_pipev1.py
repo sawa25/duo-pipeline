@@ -201,7 +201,7 @@ class FakeTransport:
     def __init__(self):
         self.calls: list[str] = []
 
-    def call(self, prompt: str, *, mode: str, timeout: int, cwd: Path | None = None):
+    def call(self, prompt: str, *, mode: str, timeout: int, cwd: Path | None = None, **_kw):
         self.calls.append(prompt)
         return "ответ", "sid-1", 0.0
 

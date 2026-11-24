@@ -247,7 +247,7 @@ class StatTransport(PairTransport):
     def take_call_stats(self):
         return {"tool_uses": self._n, "tools": {"Read": self._n} if self._n else {}}
 
-    def call(self, prompt, *, mode, timeout=0, cwd=None, resume_session=None, tag=""):
+    def call(self, prompt, *, mode, timeout=0, cwd=None, resume_session=None, tag="", **_kw):
         if SINGLE_MARK in prompt:
             self._n += self.tool_counts.pop(0) if self.tool_counts else 3
         return super().call(prompt, mode=mode, timeout=timeout, cwd=cwd,

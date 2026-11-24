@@ -420,7 +420,7 @@ EXT_REVIEW = "# Экспертное ревью\n\n## 3. Сводка для и�
 class AcceptingTransport(ScriptedTransport):
     """Как ScriptedTransport, но председатель выдаёт ACCEPT."""
 
-    def call(self, prompt, *, mode, timeout=0, cwd=None, resume_session=None, tag=""):
+    def call(self, prompt, *, mode, timeout=0, cwd=None, resume_session=None, tag="", **_kw):
         if "Председатель консилиума" in prompt and not self.responses:
             self.responses = [CHAIR_ACCEPT]
         out = super().call(prompt, mode=mode, timeout=timeout, cwd=cwd,
