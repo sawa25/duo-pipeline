@@ -189,6 +189,10 @@ DEFAULTS = {
         # (idle-kill, claude без result) с паузами api_retry_wait_sec×2^n; 0 = как раньше
         # (RuntimeError валил процесс молча посреди ревью).
         "reviewer_retries": 0,
+        # Н38: сколько пауз-повторов делает ревью при перегрузке провайдера («API Error: 529 … overloaded»,
+        # «timed out»): паузы api_retry_wait_sec×2^(k-1), потолок 240 с (по умолчанию 30+60+120+240 = 7.5 мин),
+        # деньги не тратятся (ответа нет). Исчерпаны — halt kind=transport (авто-возобновляется надзором).
+        "overload_retries": 4,
         # pipework3: «мягкий» бюджет — ревью уже сделанной исполнителем работы доводится до
         # конца, даже если бюджет исчерпан, пока потрачено < budget_usd + budget_grace_usd.
         # Жёсткая проверка бюджета — только на границе итерации (перед работой исполнителя).
@@ -203,6 +207,10 @@ DEFAULTS = {
     },
     # env ТОЛЬКО для вызовов исполнителя (mode="full"), напр. CLAUDE_STREAM_IDLE_TIMEOUT_MS
     "claude_env_full": {},
+    # env для вызовов ревьюеров/председателя (mode="plan"). Н38: лимит вывода claude CLI (32000 токенов
+    # на рассуждения И текст) исчерпывался рассуждениями glm-5.4 → «API Error: … exceeded the 32000
+    # output token maximum» / обрыв отчёта; 64000 проверено в поле (5/5 ревью)
+    "claude_env_plan": {"CLAUDE_CODE_MAX_OUTPUT_TOKENS": "64000"},
     "git": {
         "auto_branch": True,
         "branch_prefix": "duo/",
@@ -337,6 +345,25 @@ def guard_config_problems(cfg: dict) -> list[str]:
                 bad.append(f"{key}.{k}: пустое/нестроковое значение {v!r}")
             elif key == "effort" and v not in EFFORT_LEVELS:
                 bad.append(f"effort.{k}: уровень {v!r} неизвестен (допустимы {', '.join(EFFORT_LEVELS)})")
+    # Н38: claude_env_plan — переменные окружения ревьюеров; опечатка в числе лимита вывода не должна
+    # превращаться в тихое «лимит по умолчанию 32000 и обрывы отчётов»
+    envp = cfg.get("claude_env_plan")
+    if envp is not None:
+        if not isinstance(envp, dict):
+            bad.append("claude_env_plan должен быть объектом {ПЕРЕМЕННАЯ: значение}")
+        else:
+            for k, v in envp.items():
+                if str(k).startswith("_"):
+                    continue
+                if isinstance(v, bool) or not isinstance(v, (str, int)) or not str(v).strip():
+                    bad.append(f"claude_env_plan.{k}: значение должно быть непустой строкой или числом, не {v!r}")
+                elif k == "CLAUDE_CODE_MAX_OUTPUT_TOKENS" and not str(v).strip().isdigit():
+                    bad.append(f"claude_env_plan.{k}: ожидается целое число токенов, не {v!r}")
+    lim = cfg.get("limits")
+    if isinstance(lim, dict) and "overload_retries" in lim:
+        v = lim["overload_retries"]
+        if isinstance(v, bool) or not isinstance(v, int) or v < 0:
+            bad.append(f"limits.overload_retries: ожидается целое ≥ 0, не {v!r}")
     return bad
 
 
@@ -553,6 +580,20 @@ class EmptyReviewError(RuntimeError):
     """Проверяющий вернул ACCEPT, не обратившись ни к одному инструменту (и повтор тоже):
     вердикт «вакуумный», засчитывать его нельзя. Pipeline.run ловит и ставит halt
     kind=review_empty (возобновляемый: `--resume` повторит ревью)."""
+
+
+class ReviewIncompleteError(RuntimeError):
+    """Ревью не получило пригодного ответа модели по причине ДОСТАВКИ, а не содержания: провайдер
+    перегружен после всех повторов (kind=transport — авто-возобновляемый надзором) либо ответ
+    раз за разом не умещается в лимит вывода (kind=review_incomplete — решает человек). Раньше такой
+    ответ уходил в `_finish_report` и превращался в подставной `VERDICT: REVISE` — исполнитель
+    переделывал работу по несуществующему замечанию. RuntimeError: общий обработчик Pipeline.run
+    переводит его в halt; `review_cost` — всё, что потрачено на цепочку попыток."""
+
+    def __init__(self, msg: str, *, kind: str = "transport", cost: float = 0.0):
+        super().__init__(msg)
+        self.kind = kind
+        self.review_cost = cost
 
 
 class ClaudeTransportError(RuntimeError):
@@ -793,10 +834,27 @@ class ClaudeGlm:
         s["tool_uses"] += 1
         s["tools"][name] = s["tools"].get(name, 0) + 1
 
-    def _base_env(self, mode: str = "plan") -> dict:
+    # --- итог последнего вызова: stop_reason, ошибка API, части ответа (Н38) -----------------------
+    # Возврат call() — (text, session_id, cost) — не менялся (десятки вызывающих и фейков в тестах); то,
+    # что нужно классификатору «неполного отчёта», лежит в потоковом meta, как и call_stats.
+    def take_call_meta(self) -> dict:
+        m = getattr(self._tls, "meta", None) or {}
+        return dict(m)
+
+    def _base_env(self, mode: str = "plan", extra: dict | None = None) -> dict:
         env = dict(os.environ)
         env["CLAUDE_CONFIG_DIR"] = self.config_dir
         env["NO_COLOR"] = "1"
+        # claude_env_plan — для ревьюеров/председателя (mode="plan"): лимит вывода claude CLI по умолчанию
+        # 32000 токенов ОБЩИЙ на рассуждения и текст; glm-5.4 на effort high в финальном синтезе думает
+        # 105–118 тыс. знаков и упирается в него (полевая волна 1: 6 из 9 неполных отчётов, $4+ за
+        # попытку). 64000 — проверено в поле (5/5 ревью без обрывов).
+        if mode == "plan":
+            for k, v in (self.cfg.get("claude_env_plan") or {}).items():
+                if not str(k).startswith("_"):
+                    env[str(k)] = str(v)
+        for k, v in (extra or {}).items():       # точечное переопределение вызова (повтор после обрыва)
+            env[str(k)] = str(v)
         # claude_env_full — только для вызовов исполнителя (mode="full"): длинные
         # генерации (отчёты/тесты) упираются во встроенный idle-watchdog стрима
         # claude CLI (пол 300 с без байт; повышается лишь CLAUDE_STREAM_IDLE_TIMEOUT_MS)
@@ -820,6 +878,8 @@ class ClaudeGlm:
         role: str = "",                     # executor | reviewer | chairman → models[role]
         persona: str = "",                  # имя ревьюера (socrates2…) → models[persona]
         model: str = "",                    # явный алиас (закреплённый за серией исполнитель)
+        effort: str = "",                   # явный --effort на этот вызов (повтор после output_limit)
+        env_extra: dict | None = None,      # доп. переменные окружения только этому вызову
     ) -> tuple[str, str | None, float]:
         """Потоковый вызов с watchdog по неактивности.
 
@@ -830,7 +890,7 @@ class ClaudeGlm:
         для алиаса задан effort в конфиге. Возвращает (text, session_id, cost_usd).
         """
         alias = model or (role_model(self.cfg, role, persona) if role else self.model)
-        effort = role_effort(self.cfg, alias)
+        effort = effort if effort in EFFORT_LEVELS else role_effort(self.cfg, alias)
         cmd = ["claude", "-p"]
         deny = executor_deny_rules(self.cfg) if mode == "full" else []
         if deny:
@@ -851,7 +911,7 @@ class ClaudeGlm:
         cmd.append(prompt)
         idle_limit = timeout
         proc = subprocess.Popen(
-            cmd, cwd=cwd, env=self._base_env(mode),
+            cmd, cwd=cwd, env=self._base_env(mode, env_extra),
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
         )
         out_q: queue.Queue[str | None] = queue.Queue()
@@ -868,10 +928,35 @@ class ClaudeGlm:
         session_id = None
         cost = 0.0
         got_result = False
+        # Н38: итог вызова для классификатора неполного отчёта. tail — тексты сообщений ПОСЛЕ последнего
+        # tool_use (финальный ответ; при max_tokens claude CLI продолжает ход НОВЫМ сообщением, а в
+        # result.result остаётся лишь последнее). stop_reason в потоке у assistant-событий не заполнен —
+        # достоверен только в result-событии.
+        meta: dict = {"stop_reason": None, "is_error": False, "api_error_status": None, "subtype": None,
+                      "terminal_reason": None, "num_turns": None, "thinking_chars": 0, "messages": 0,
+                      "thinking_tokens_peak": 0, "tail_msgs": []}
+        seen_msg: set[str] = set()
+        self._tls.meta = meta
         last_activity = time.time()
         call_started = last_activity
-        next_beat = last_activity + TRANSPORT_HEARTBEAT_SEC
+        last_print = last_activity          # когда оркестратор в последний раз что-то напечатал в консоль
+        think_now = 0                       # оценка токенов рассуждений текущего сообщения (system/thinking_tokens)
         idle_killed = False
+
+        def beat(now: float) -> None:
+            """Н24/Н40: пульс по ВРЕМЕНИ ПОСЛЕДНЕГО ВЫВОДА В КОНСОЛЬ, а не по тишине потока. Пока модель
+            «думает», claude CLI шлёт события `system/thinking_tokens` десятками в секунду (по замеру:
+            8426 событий за 141 с) — поток не молчит ни секунды, а консоль пуста минутами (поле: 24 мин
+            без единой строки, пульс ни разу не вышел). Тишина потока по-прежнему отсекается idle-лимитом;
+            строка пульса показывает оба времени и размер рассуждений."""
+            nonlocal last_print
+            if now - last_print < TRANSPORT_HEARTBEAT_SEC:
+                return
+            tk = f", рассуждений ≈{think_now} ток." if think_now else ""
+            print(f"    … жду ответ модели: без вывода {int(now - last_print)} с, "
+                  f"тишина потока {int(now - last_activity)} с (отсечка по тишине {idle_limit} с){tk}", flush=True)
+            last_print = now
+
         while True:
             try:
                 line = out_q.get(timeout=TRANSPORT_POLL_SEC)
@@ -883,12 +968,7 @@ class ClaudeGlm:
                     idle_killed = True
                     proc.kill()
                     break
-                if now >= next_beat:
-                    # Н24: молчащий вызов (модель «думает» до минут) выглядел в консоли и в `status` как
-                    # зависший оркестратор; пульс показывает, что процесс жив, и сколько до отсечки
-                    print(f"    … жду ответ модели: тишина {int(now - last_activity)} с "
-                          f"(отсечка по тишине {idle_limit} с)", flush=True)
-                    next_beat = now + TRANSPORT_HEARTBEAT_SEC
+                beat(now)
                 continue
             if line is None:
                 break
@@ -896,7 +976,7 @@ class ClaudeGlm:
             if not line:
                 continue
             last_activity = time.time()
-            next_beat = last_activity + TRANSPORT_HEARTBEAT_SEC
+            beat(last_activity)
             try:
                 ev = json.loads(line)
             except json.JSONDecodeError:
@@ -907,10 +987,20 @@ class ClaudeGlm:
                 session_id = ev.get("session_id")
             et = ev.get("type")
             if et == "assistant":
+                mid = str(ev.get("message", {}).get("id") or "-")
+                if mid not in seen_msg:
+                    seen_msg.add(mid)
+                    meta["messages"] += 1
+                    meta["tail_msgs"].append("")
                 for block in ev.get("message", {}).get("content", []):
                     if block.get("type") == "text":
                         text_parts.append(block.get("text", ""))
+                        meta["tail_msgs"][-1] += block.get("text", "")
+                    elif block.get("type") == "thinking":
+                        meta["thinking_chars"] += len(block.get("thinking") or "")
                     elif block.get("type") == "tool_use":
+                        meta["tail_msgs"] = [""]            # всё до инструмента — реплики по ходу, не ответ
+                        seen_msg = {mid}
                         name = block.get("name", "?")
                         self._count_tool_use(str(name))
                         inp = block.get("input", {})
@@ -921,13 +1011,24 @@ class ClaudeGlm:
                         el = int(time.time() - call_started)
                         n_calls = self.take_call_stats()["tool_uses"]
                         print(f"    · [{el // 60:02d}:{el % 60:02d} #{n_calls}] {name}({brief})", flush=True)
+                        last_print = time.time()
+            elif et == "system" and ev.get("subtype") == "thinking_tokens":
+                try:
+                    think_now = int(ev.get("estimated_tokens") or 0)
+                except (TypeError, ValueError):
+                    think_now = 0
+                meta["thinking_tokens_peak"] = max(int(meta.get("thinking_tokens_peak") or 0), think_now)
             elif et == "result":
                 # финальный текст берём из result-события; дубли не копим
                 session_id = ev.get("session_id")
                 cost = float(ev.get("total_cost_usd") or 0.0)
                 got_result = True
+                for k in ("stop_reason", "is_error", "api_error_status", "subtype", "terminal_reason", "num_turns"):
+                    if k in ev:
+                        meta[k] = ev.get(k)
                 if ev.get("result"):
                     text_parts = [ev["result"]]
+        meta["tail_msgs"] = [p for p in meta["tail_msgs"] if p]     # сообщения без текста (чистое мышление)
         if idle_killed and not got_result:
             raise ClaudeTransportError(
                 f"таймаут неактивности {idle_limit}s (нет событий stream-json; процесс убит)",
@@ -1262,6 +1363,91 @@ def is_api_error_text(text: str | None) -> bool:
     return bool(text) and bool(API_ERROR_RE.match(text))
 
 
+# --- классы «неполного отчёта» (полевой отчёт полевая волна 1, Н38; 9 случаев) ------------------
+# До этого любой ответ без `# rev —`/VERDICT считался «неполным отчётом» и лечился одним лекарством —
+# ретраем с припиской «выведи ПОЛНЫЙ отчёт». Разбор журналов показал: формат модель выдаёт верно, когда
+# ответ дошёл до конца (синтетика на glm-5.4: effort high и low — заголовок, §0, §1, VERDICT последней
+# строкой). Ломается не формат, а доставка ответа, и классы лечатся по-разному:
+#   output_limit — рассуждения (thinking) съели общий лимит вывода (32000 токенов у claude CLI): «API Error:
+#                  Claude's response exceeded the 32000 output token maximum» либо stop_reason=max_tokens.
+#                  Повтор «с припиской» бесполезен и дорог ($4+ за попытку); лечится большим лимитом
+#                  (claude_env_plan) и пониженным effort на повторе;
+#   transient    — провайдер перегружен/сеть («API Error: 529 [1305] … temporarily overloaded»,
+#                  «The operation timed out»): повтор имеет смысл только ПОСЛЕ паузы, формат ни при чём;
+#   api_error    — прочая «API Error: …» (не транзиентная и не лимит): повтор без пояснений о формате;
+#   stub         — пустой ответ / ExitPlanMode / ссылка на plan-файл (инцидент ingestclient rev011);
+#   format       — текст пришёл, но не `# rev —`-отчёт с VERDICT: единственный класс, где уместна приписка.
+OUTPUT_LIMIT_RE = re.compile(r"output token maximum|CLAUDE_CODE_MAX_OUTPUT_TOKENS|max_output_tokens", re.IGNORECASE)
+TRANSIENT_API_RE = re.compile(
+    r"\b(?:429|500|502|503|504|529)\b|overload|rate.?limit|try again|timed out|timeout|connection",
+    re.IGNORECASE)
+FAILURE_CLASSES = ("output_limit", "transient", "api_error", "stub", "format")
+
+LIMIT_RETRY_HINT = (
+    "\n\nПредыдущая попытка не уложилась в лимит вывода модели: рассуждения заняли весь бюджет токенов, "
+    "до отчёта дело не дошло. Рассуждай КОРОТКО: не составляй черновик отчёта в рассуждениях, "
+    "после проверки сразу выводи итоговый отчёт по формату (`# rev —` … машинная строка VERDICT в конце)."
+)
+# повтор после output_limit: не больше стольких раз (каждая попытка стоит денег, в отличие от 529);
+# сверх этого — halt `review_incomplete` с решением человека (effort ниже / лимит выше в .duo/config.json)
+OUTPUT_LIMIT_MAX_RETRIES = 1
+# счётчики деградации ревью (review_telemetry): stub — ответ-заглушка в R1–R3; transport — повтор по
+# сбою транспорта; incomplete — повтор по структурному браку (format/stub); overload — пауза+повтор при
+# перегрузке провайдера; limit — повтор после output_limit; stitched — отчёт собран из частей
+REVIEW_EV_ZERO = {"stub_retries": 0, "transport_retries": 0, "incomplete_retries": 0,
+                  "overload_retries": 0, "limit_retries": 0, "stitched": 0}
+
+
+def classify_failure(text: str | None, meta: dict | None = None) -> str:
+    """Класс непринятого ответа ревьюера/председателя (см. FAILURE_CLASSES). `meta` — итог транспорта
+    (`ClaudeGlm.take_call_meta`: stop_reason / api_error_status); None — транспорт его не ведёт, тогда
+    решает только текст ответа."""
+    t = text or ""
+    m = meta if isinstance(meta, dict) else {}
+    if is_api_error_text(t):
+        if OUTPUT_LIMIT_RE.search(t):
+            return "output_limit"
+        try:
+            status = int(m.get("api_error_status") or 0)
+        except (TypeError, ValueError):
+            status = 0
+        if TRANSIENT_API_RE.search(t) or status in (429, 500, 502, 503, 504, 529):
+            return "transient"
+        return "api_error"
+    if m.get("stop_reason") == "max_tokens":        # обрыв по лимиту посреди ответа (в т.ч. пустой текст)
+        return "output_limit"
+    if not t.strip() or REVIEWER_STUB_RE.search(t):
+        return "stub"
+    return "format"
+
+
+def lower_effort(level: str) -> str:
+    """Ступенью ниже: max/xhigh → high → medium → low (low остаётся low); пустой (дефолт CLI) → medium."""
+    order = ("low", "medium", "high", "xhigh", "max")
+    if level not in order:
+        return "medium"
+    if level in ("xhigh", "max"):
+        return "high"
+    return order[max(0, order.index(level) - 1)]
+
+
+def stitch_messages(parts: list[str]) -> str:
+    """Склейка ответа, разорванного лимитом вывода: claude CLI при `max_tokens` сам продолжает ход новым
+    сообщением, а `result.result` хранит только ПОСЛЕДНЕЕ — оркестратор видел хвост отчёта без начала
+    (поле, случай B: 3 из 9). parts — тексты сообщений последнего хода по порядку. Если продолжение
+    начинается с уже выведенной строки (модель «перезапустилась» с пункта 7), дубль срезается по ПЕРВОЙ
+    строке продолжения (≥12 знаков); иначе — прямая склейка (шов бывает посреди слова)."""
+    parts = [p for p in parts if p]
+    if not parts:
+        return ""
+    acc = parts[0]
+    for p in parts[1:]:
+        head = p.lstrip().split("\n", 1)[0].strip()
+        idx = acc.rfind(head) if len(head) >= 12 else -1
+        acc = acc[:idx] + p.lstrip() if idx >= 0 else acc + p
+    return acc
+
+
 # --- guard пустого ревью (29.10.2026, боевой инцидент: ревью impl) ---------------------------
 # Проверяющий вернул «VERDICT: ACCEPT», признав в тексте «нет инструментов / файл не читан», и
 # оркестратор принял вердикт «по букве протокола». Критерий пустоты — ФАКТ из транспорта (число
@@ -1450,6 +1636,7 @@ def read_plan_errata(base: Path, plan_rel: str) -> str:
 ERRATA_REV_HEADING = re.compile(
     r"^(#{1,6})[ \t]+(?:\d+[.)][ \t]+)?эрраты(?:[ \t]+к[ \t]+плану)?[ \t]*:?[ \t]*$", re.I)
 _ERRATA_ITEM = re.compile(r"^\s*(?:[-*+]|\d+[.)])\s+(.*)$")
+_ERRATA_TOP_ITEM = re.compile(r"^(?:[-*+]|\d+[.)])\s+")          # без отступа: «сама эррата», не подпункт
 _VERDICT_LINE = re.compile(r"\**\s*VERDICT:\s*\**\s*(ACCEPT|REVISE)\s*\**", re.I)
 _FALLBACK_NOTE = re.compile(r"^\*?\(дописано оркестратором:.*\)\*?$")
 
@@ -1498,6 +1685,16 @@ def extract_chairman_errata(rev_text: str) -> str | None:
                     or _FALLBACK_NOTE.match(body[-1].strip())):
         body.pop()
     return "\n".join(body).strip("\n").strip()
+
+
+def errata_count_text(info: dict) -> str:
+    """Н34: число эррат для человека. `items` считает ВСЕ строки списка (в т. ч. вложенные подпункты) —
+    в поле «21 пунктов» при 9 пронумерованных эрратах, и оператор читал «К = число эррат». Если
+    верхнеуровневых строк известно и оно меньше — показываем оба числа."""
+    items, top = info.get("items", "?"), info.get("top_items") or 0
+    if top and isinstance(items, int) and top < items:
+        return f"{top} п. (строк списка с вложенными: {items})"
+    return f"{items} п."
 
 
 def _errata_signatures(body: str) -> list[str]:
@@ -1558,7 +1755,8 @@ def apply_accept_errata(rev_path: Path, plan_path: Path) -> tuple[str, dict]:
     if not all(sg in check for sg in sigs):
         Path(plan_path).write_text(plan_text, encoding="utf-8")        # откат
         raise ErrataError(f"проверка после записи не прошла (эрраты {rev_name} не найдены в плане) — план восстановлен")
-    return "applied", {"items": len(sigs), "sha": sha}
+    top = sum(1 for ln in body.splitlines() if _ERRATA_TOP_ITEM.match(ln))
+    return "applied", {"items": len(sigs), "top_items": top, "sha": sha}
 
 
 def errata_block_reviewer(plan_rel: str, errata: str) -> str:
@@ -1818,14 +2016,14 @@ class DuoReviewer:
         self.call_cost = 0.0   # pipev3 P0: per-call аккумулятор текущего review()
         # события транспорта ревью текущего review() — в телеметрию и в `status --task`
         # (раньше ретрай заглушки был виден только в orchestrator.log). Ревьюеры идут в потоках.
-        self._ev = {"stub_retries": 0, "transport_retries": 0}
+        self._ev = dict(REVIEW_EV_ZERO)
         self._ev_lock = threading.Lock()
 
     def _bump(self, key: str) -> None:
         # устойчив к объекту без __init__ (тесты собирают DuoReviewer через __new__)
         lock = self.__dict__.setdefault("_ev_lock", threading.Lock())
         with lock:
-            ev = self.__dict__.setdefault("_ev", {"stub_retries": 0, "transport_retries": 0})
+            ev = self.__dict__.setdefault("_ev", dict(REVIEW_EV_ZERO))
             ev[key] = ev.get(key, 0) + 1
 
     def _acc(self, cost: float) -> None:
@@ -1850,27 +2048,78 @@ class DuoReviewer:
         return ((not text or not text.strip()) or bool(REVIEWER_STUB_RE.search(text))
                 or is_api_error_text(text))
 
+    def _take_meta(self) -> dict:
+        """Итог последнего вызова транспорта (stop_reason, части ответа…); {} — транспорт его не ведёт
+        (заглушки в тестах). Потокобезопасно: meta лежит в threading.local транспорта."""
+        fn = getattr(self.t, "take_call_meta", None)
+        m = fn() if callable(fn) else None
+        return m if isinstance(m, dict) else {}
+
+    def _pause_transient(self, k: int, why: str, who: str, limit: int) -> None:
+        """Пауза перед повтором при перегрузке провайдера: api_retry_wait_sec × 2^(k-1), потолок 240 с.
+        Мгновенный повтор на 529 бесполезен — окно перегрузки длится минуты (поле: три попытки подряд
+        в одно окно, каждая «сгорала» за секунды и засчитывалась как «неполный отчёт»)."""
+        wait = float(self.cfg.get("timeouts", {}).get("api_retry_wait_sec", 30))
+        delay = min(wait * (2 ** (k - 1)), 240.0)
+        log(self.task_dir, f"ВНИМАНИЕ: {who}: провайдер недоступен ({why[:120]}) — пауза {delay:.0f} с, "
+                           f"повтор {k}/{limit} (к формату отчёта это не относится)")
+        self._bump("overload_retries")
+        time.sleep(delay)
+
+    def _limit_retry_extra(self, persona: str) -> dict:
+        """Параметры повтора после output_limit: effort на ступень ниже + лимит вывода не ниже 64000
+        (если claude_env_plan его уже не задаёт). Без записи effort для алиаса (дефолт CLI) — medium."""
+        alias = role_model(self.cfg, "reviewer" if persona else "chairman", persona)
+        extra: dict = {"effort": lower_effort(role_effort(self.cfg, alias))}
+        try:
+            cur = int((self.cfg.get("claude_env_plan") or {}).get("CLAUDE_CODE_MAX_OUTPUT_TOKENS") or 0)
+        except (TypeError, ValueError):
+            cur = 0
+        if cur < 64000:
+            extra["env_extra"] = {"CLAUDE_CODE_MAX_OUTPUT_TOKENS": "64000"}
+        return extra
+
     def _reviewer_call(self, prompt: str, tag: str, persona: str = "") -> tuple[str, float, str]:
         """Вызов ревьюера с одним ретраем на ответ-заглушку.
 
         Возвращает (text, суммарная_стоимость, фактический_промпт); провальная
         первая попытка сохраняется в transcripts/ тегом {tag}_attempt1 (forensic-след,
         прецедент chairman_attempt{N}). Если и ретрай — заглушка, возвращается он
-        (parse_stance даст abstain) — без каскада ретраев."""
+        (parse_stance даст abstain) — без каскада ретраев. Н38: лекарство по классу сбоя —
+        перегрузка провайдера → пауза и тот же промпт; лимит вывода → effort ниже и подсказка «думай
+        коротко»; приписка про ExitPlanMode — только для настоящей заглушки."""
         timeout = self.cfg["timeouts"]["reviewer_sec"]
         text, _, cost = self._transport_retry(
             lambda: self.t.call(prompt, mode="plan", timeout=timeout, cwd=self.repo,
                                 role="reviewer", persona=persona), tag)
-        if not self._is_stub_response(text):
+        meta = self._take_meta()
+        if not self._is_stub_response(text) and meta.get("stop_reason") != "max_tokens":
             return text, cost, prompt
-        log(self.task_dir, f"ВНИМАНИЕ: ответ {tag} — заглушка (ExitPlanMode/пусто/API Error) — ретрай с уточнением")
+        kind = classify_failure(text, meta)
+        log(self.task_dir, f"ВНИМАНИЕ: ответ {tag} — заглушка/сбой (класс: {kind}; ExitPlanMode/пусто/API Error) "
+                           f"— ретрай с уточнением")
         self._bump("stub_retries")
-        self._save_tr(f"{tag}_attempt1", prompt, text, cost)
-        retry_prompt = prompt + REVIEWER_STUB_RETRY_SUFFIX
+        self._save_tr(f"{tag}_attempt1", prompt, text, cost, note=self._attempt_note(kind, meta))
+        retry_prompt, extra = prompt, {}
+        if kind == "transient":
+            self._pause_transient(1, text.strip(), tag, 1)
+        elif kind == "output_limit":
+            self._bump("limit_retries")
+            retry_prompt, extra = prompt + LIMIT_RETRY_HINT, self._limit_retry_extra(persona)
+        elif kind != "api_error":
+            retry_prompt = prompt + REVIEWER_STUB_RETRY_SUFFIX
         text2, _, cost2 = self._transport_retry(
             lambda: self.t.call(retry_prompt, mode="plan", timeout=timeout, cwd=self.repo,
-                                role="reviewer", persona=persona), tag)
+                                role="reviewer", persona=persona, **extra), tag)
+        self._take_meta()
         return text2, cost + cost2, retry_prompt
+
+    @staticmethod
+    def _attempt_note(kind: str, meta: dict) -> str:
+        """Строка для шапки транскрипта отброшенной попытки: класс сбоя и то, что видел транспорт."""
+        return (f"класс={kind}; stop_reason={meta.get('stop_reason')}; сообщений={meta.get('messages')}; "
+                f"рассуждений={meta.get('thinking_chars')} знаков (пик ≈{meta.get('thinking_tokens_peak')} ток.); "
+                f"api_error_status={meta.get('api_error_status')}")
 
     def _transport_retry(self, fn, what: str):
         """pipework3: повтор вызова ревьюера/председателя при транспортном сбое claude CLI
@@ -1892,31 +2141,46 @@ class DuoReviewer:
                 log(self.task_dir, f"РЕВЬЮ: {what}: {str(e)[:140]} — повтор {attempt}/{retries} через {delay:.0f}с")
                 time.sleep(delay)
 
-    def _save_tr(self, tag: str, prompt: str, resp: str, cost: float) -> None:
+    def _save_tr(self, tag: str, prompt: str, resp: str, cost: float, note: str = "") -> None:
         f = self.transcripts / f"{datetime.now().strftime('%H%M%S')}_{tag}.md"
         f.write_text(
-            f"# {tag}\ncost=${cost:.4f}\n\n"
-            f"<!-- Структура: ## PROMPT — что получила персона. Внутри PROMPT блок "
+            f"# {tag}\ncost=${cost:.4f}\n"
+            + (f"{note}\n" if note else "")
+            + f"\n<!-- Структура: ## PROMPT — что получила персона. Внутри PROMPT блок "
             f"«Исходная задача (контекст)» в кавычках \"\"\" — ЦИТАТА задания исполнителя "
             f"(task.md), адресовано НЕ этой персоне. ## RESPONSE — ответ персоны. -->\n\n"
             f"## PROMPT\n\n{prompt}\n\n## RESPONSE\n\n{resp}\n",
             encoding="utf-8",
         )
 
-    def _call_chairman_once(self, prompt: str, timeout: int, persona: str = "") -> tuple[str, float]:
+    def _final_note(self) -> str:
+        """Пометка к ИТОГОВОМУ транскрипту шага: его cost= — кумулятив всех вызовов шага, включая
+        отброшенные попытки (Н42 (поле): контроллер суммировал cost= итогового и *_attemptN —
+        двойной счёт, «невидимые» $18 оказались в основном им)."""
+        calls = int(self.__dict__.get("_chain_calls", 0) or 0)
+        if calls <= 1:
+            return ""
+        return (f"cost= — КУМУЛЯТИВ всех {calls} вызовов этого шага (отброшенные попытки лежат рядом как "
+                f"*_attemptN, их cost= уже ВХОДИТ в эту сумму — не складывать)")
+
+    def _call_chairman_once(self, prompt: str, timeout: int, persona: str = "", **extra) -> tuple[str, float]:
         """Один вызов председателя (persona — единственный проверяющий pair: роль reviewer, модель
-        по его имени); при сбое/таймауте — ретрай с удвоенным таймаутом."""
+        по его имени); при сбое/таймауте — ретрай с удвоенным таймаутом. extra — effort/env_extra
+        повтора после output_limit (пусто — вызов байт-в-байт прежний)."""
         role = "reviewer" if persona else "chairman"
         try:
             report, _, cost = self.t.call(prompt, mode="plan", timeout=timeout, cwd=self.repo,
-                                          role=role, persona=persona)
+                                          role=role, persona=persona, **extra)
             return report, cost
         except RuntimeError:
             log(self.task_dir, "председатель: сбой/таймаут — ретрай с удвоенным таймаутом")
             report, _, cost = self._transport_retry(
                 lambda: self.t.call(prompt, mode="plan", timeout=timeout * 2, cwd=self.repo,
-                                    role=role, persona=persona), "chairman")
+                                    role=role, persona=persona, **extra), "chairman")
             return report, cost
+
+    def _valid_report(self, report: str) -> bool:
+        return self._looks_like_report(report) and self._parse_verdict(report) is not None
 
     def _chairman_with_retry(self, chairman_prompt: str, *, tag: str = "chairman",
                              who: str = "председатель", persona: str = "") -> tuple[str, float, str]:
@@ -1927,43 +2191,116 @@ class DuoReviewer:
         имена транскриптов (chairman_attempt{N}) и прежние тексты лога.
 
         Помимо транспортного ретрая (RuntimeError внутри _call_chairman_once,
-        semantics прежнего кода сохранена), ретраится структурно дегенеративный
-        вывод — ответ, не прошедший _looks_like_report или _parse_verdict:
-        в промпт дописывается аугментация с цитатой неудачного ответа.
+        semantics прежнего кода сохранена), ретраится непринятый ответ — НО по классу сбоя (Н38,
+        classify_failure): только структурный брак (`format`/`stub`) получает аугментацию «выведи ПОЛНЫЙ
+        отчёт» с цитатой неудачного ответа и расходует CHAIRMAN_MAX_ATTEMPTS; перегрузка провайдера
+        (`transient`, 529) — пауза и тот же промпт, отдельный счётчик limits.overload_retries (деньги не
+        тратятся); `output_limit` — ОДИН повтор с effort ниже (OUTPUT_LIMIT_MAX_RETRIES), затем halt.
+        Ответ, разорванный лимитом вывода на несколько сообщений, склеивается (stitch_messages) вместо
+        повторной оплаты. Исчерпание транзиентных классов — ReviewIncompleteError (halt), а не подставной
+        REVISE из текста ошибки; исчерпание структурного брака — прежний фолбэк review().
         Каждая непринятая попытка целиком сохраняется в transcripts/ тегом
-        chairman_attempt{N} (forensic-след класса d10, Н2 rev001).
+        chairman_attempt{N} (forensic-след класса d10, Н2 rev001), в журнале — её класс и стоимость.
         Возвращает (report, total_cost, фактический_промпт) — при успехе
         ретрая это аугментированный промпт, review() сохраняет его в тег
-        chairman без рассинхрона с chairman_attempt{N} (Н3 rev003).
+        chairman без рассинхрона с chairman_attempt{N} (Н3 rev003). Исключение — после
+        self._acc(total_cost): стоимость цепочки не теряется для spent_usd.
         """
         total_cost = 0.0
         prompt = chairman_prompt
         report = ""
-        for n in range(1, CHAIRMAN_MAX_ATTEMPTS + 1):
+        fmt_n = limit_n = trans_n = call_n = 0
+        extra: dict = {}
+        max_trans = int(self.cfg.get("limits", {}).get("overload_retries", 4) or 0)
+        last_kind = "format"
+        while True:
+            call_n += 1
+            self._chain_calls = int(self.__dict__.get("_chain_calls", 0) or 0) + 1
             # pair: единственный проверяющий — читатель артефакта, а не сводящий отчёты председатель;
             # его idle-лимит — reviewer_sec (на glm-5.4 длинное «молчаливое» мышление)
             tmo = self.cfg["timeouts"]["reviewer_sec" if persona else "chairman_sec"]
-            report, cost = self._call_chairman_once(prompt, tmo, persona=persona)
+            try:
+                report, cost = self._call_chairman_once(prompt, tmo, persona=persona, **extra)
+            except RuntimeError:
+                if total_cost:
+                    self._acc(total_cost)       # отброшенные попытки уже оплачены — не терять из учёта
+                raise
             total_cost += cost
+            meta = self._take_meta()
             # chmguard R4: сначала санирайзер преамбулы — большинство
             # «дегенеративных» ответов были валидными отчётами с лишней
             # вводной строкой (ложный ретрай стоил $0.5-0.9)
             report = self._sanitize_preamble(report)
-            if self._looks_like_report(report) and self._parse_verdict(report) is not None:
+            if self._valid_report(report):
                 return report, total_cost, prompt
-            self._save_tr(f"{tag}_attempt{n}", prompt, report, cost)
-            if n < CHAIRMAN_MAX_ATTEMPTS:
-                log(self.task_dir, f"ВНИМАНИЕ: {who} вернул неполный отчёт "
-                                   f"(попытка {n}/{CHAIRMAN_MAX_ATTEMPTS}) — ретрай с уточнением формата")
+            parts = [p for p in (meta.get("tail_msgs") or []) if p]
+            if len(parts) > 1:
+                stitched = self._sanitize_preamble(stitch_messages(parts))
+                if self._valid_report(stitched):
+                    log(self.task_dir, f"СКЛЕЙКА: ответ {who} разорван лимитом вывода на {len(parts)} сообщений "
+                                       f"— отчёт собран из частей (валиден), повторная оплата не нужна")
+                    self._bump("stitched")
+                    return stitched, total_cost, prompt
+            kind = last_kind = classify_failure(report, meta)
+            self._save_tr(f"{tag}_attempt{call_n}", prompt, report, cost, note=self._attempt_note(kind, meta))
+            log(self.task_dir, f"{who}: попытка {call_n} не принята — класс {kind}, ${cost:.2f}, "
+                               f"рассуждений {meta.get('thinking_chars', '?')} знаков "
+                               f"(пик ≈{meta.get('thinking_tokens_peak', '?')} ток.), "
+                               f"сообщений {meta.get('messages', '?')}")
+            if kind == "transient":
+                trans_n += 1
+                if trans_n > max_trans:
+                    self._acc(total_cost)
+                    raise ReviewIncompleteError(
+                        f"{who}: провайдер недоступен после {max_trans} пауз-повторов "
+                        f"({report.strip()[:160]})", kind="transport", cost=total_cost)
+                self._pause_transient(trans_n, report.strip(), who, max_trans)
+                prompt, extra = chairman_prompt, {}
+                continue
+            if kind == "output_limit":
+                limit_n += 1
+                if limit_n > OUTPUT_LIMIT_MAX_RETRIES:
+                    self._acc(total_cost)
+                    raise ReviewIncompleteError(
+                        f"{who}: ответ не умещается в лимит вывода модели (рассуждения съедают бюджет токенов; "
+                        f"повтор с пониженным effort тоже не помог). Понизь effort роли в .duo/config.json "
+                        f"(`effort.opus: medium`) или подними CLAUDE_CODE_MAX_OUTPUT_TOKENS в claude_env_plan, "
+                        f"затем `run --resume`", kind="review_incomplete", cost=total_cost)
+                extra = self._limit_retry_extra(persona)
+                log(self.task_dir, f"ВНИМАНИЕ: {who} упёрся в лимит вывода (рассуждения заняли бюджет токенов) — "
+                                   f"ретрай {limit_n}/{OUTPUT_LIMIT_MAX_RETRIES} с effort {extra['effort']} "
+                                   f"и просьбой думать коротко")
+                self._bump("limit_retries")
+                prompt = chairman_prompt + LIMIT_RETRY_HINT
+                continue
+            fmt_n += 1
+            if fmt_n >= CHAIRMAN_MAX_ATTEMPTS:
+                log(self.task_dir, f"ВНИМАНИЕ: {who} вернул неполный отчёт (класс {kind}, "
+                                   f"попытка {fmt_n}/{CHAIRMAN_MAX_ATTEMPTS}) — попытки исчерпаны, "
+                                   f"отдаю фолбэку review()")
+                break
+            self._bump("incomplete_retries")
+            log(self.task_dir, f"ВНИМАНИЕ: {who} вернул неполный отчёт (класс {kind}, "
+                               f"попытка {fmt_n}/{CHAIRMAN_MAX_ATTEMPTS}) — ретрай"
+                               + ("" if kind == "api_error" else " с уточнением формата"))
+            extra = {}
+            if kind == "api_error":
+                prompt = chairman_prompt           # ошибка API — не формат: приписка про отчёт неуместна
+            elif kind == "stub":
+                prompt = chairman_prompt + REVIEWER_STUB_RETRY_SUFFIX
+            else:
                 snippet = report.strip()[:200]
                 prompt = chairman_prompt + (
                     f"\n\nПредыдущая попытка вернула неполный/невалидный ответ (цитата: «{snippet}»)."
                     "\nВыведи ПОЛНЫЙ отчёт по формату, начиная с `# rev —`,"
                     " до машинной строки VERDICT в конце."
                 )
-            else:
-                log(self.task_dir, f"ВНИМАНИЕ: {who} вернул неполный отчёт "
-                                   f"(попытка {n}/{CHAIRMAN_MAX_ATTEMPTS}) — попытки исчерпаны, отдаю фолбэку review()")
+        if last_kind in ("api_error", "stub") and (is_api_error_text(report) or not report.strip()):
+            # текст ошибки/пустота нельзя отдавать в _finish_report: он станет подставным REVISE
+            self._acc(total_cost)
+            raise ReviewIncompleteError(
+                f"{who}: модель не вернула ответа ({last_kind}: {report.strip()[:160] or 'пусто'}) "
+                f"за {call_n} вызовов", kind="transport", cost=total_cost)
         return report, total_cost, prompt
 
     def _round1(self, member: dict, artifact_rel: str, phase: str, task_text: str,
@@ -2425,7 +2762,21 @@ VERDICT: REVISE"""
 {self._checks_blocks(phase, artifact_rel)}
 {self._report_rules(single=True)}"""
 
-    def review(
+    def review(self, **kw) -> tuple[str, float, dict]:
+        """Полный цикл ревью (аргументы — только именованные, см. _review_impl). Н42: при ЛЮБОМ исключении
+        к нему прикладывается `review_cost` — всё, что этот вызов уже потратил (отброшенные попытки,
+        R1–R3): Pipeline добавляет его в spent_usd перед halt. Раньше цена ревью, умершего посреди
+        цепочки, не попадала в бюджет серии вовсе (поле: ≈ $8 на одной серии)."""
+        try:
+            return self._review_impl(**kw)
+        except Exception as e:
+            try:
+                e.review_cost = round(float(getattr(self, "call_cost", 0.0) or 0.0), 4)
+            except Exception:
+                pass
+            raise
+
+    def _review_impl(
         self,
         *,
         artifact_rel: str,
@@ -2452,8 +2803,9 @@ VERDICT: REVISE"""
         stateless). Пишет rev-файл.
         """
         self.call_cost = 0.0   # P0: per-call аккумулятор этого review()
+        self._chain_calls = 0  # Н42: число вызовов модели в цепочках шага (для пометки в итоговом транскрипте)
         with self._ev_lock:
-            self._ev = {"stub_retries": 0, "transport_retries": 0}
+            self._ev = dict(REVIEW_EV_ZERO)
         if len(members) == 1:
             # режим pair: единственный проверяющий вместо дуэта и председателя
             return self._review_single(
@@ -2517,7 +2869,7 @@ VERDICT: REVISE"""
         report, cost, prompt_used = self._chairman_with_retry(chairman_prompt)
         self._acc(cost)
         guard.enforce_readonly(before, artifacts_rel, self.task_dir)
-        self._save_tr("chairman", prompt_used, report, cost)
+        self._save_tr("chairman", prompt_used, report, cost, note=self._final_note())
 
         report, verdict = self._finish_report(report)
 
@@ -2647,7 +2999,7 @@ VERDICT: REVISE"""
             guard.enforce_readonly(before, artifacts_rel, self.task_dir)
             stats = self._take_tool_stats()
             reason = empty_review_reason(self.cfg, self._parse_verdict(report), report, stats)
-        self._save_tr(tag, prompt_used, report, cost)
+        self._save_tr(tag, prompt_used, report, cost, note=self._final_note())
         if reason:
             raise EmptyReviewError(reason)
         report, verdict = self._finish_report(report, gen="проверяющего", nom="проверяющий")
@@ -2932,11 +3284,30 @@ class Executor:
 места остановки). НЕ пытайся выполнить ВСЁ за один вызов: длинные
 фоновые операции (скачивание) запускай и переходи к следующему шагу,
 контролируй их в следующих вызовах.
-Когда ВСЁ по DoD таска выполнено — проверь DoD по пунктам, допиши
+{self._solo_commit_plan_block()}Когда ВСЁ по DoD таска выполнено — проверь DoD по пунктам, допиши
 в solo_report.md строку «## SOLO_DONE» и заверши ответ строкой:
 SOLO_DONE
 Иначе заверши ответ кратким статусом (что идёт фоном, что дальше)."""
         return self._send(prompt, f"solo_turn_{turn}")
+
+    def _solo_commit_plan_block(self) -> str:
+        """Н35: solo-серия в worktree доходит до `main` через `commit-by-plan`, а ему нужен отчёт с
+        разметкой коммитов, которого solo-цикл не требует. Полевая проверка (полевая волна 1): одной
+        строки в task.md хватило, чтобы исполнитель на flash сам написал `impl_report_v1.md` и
+        `commit-by-plan` прошёл без ручных артефактов. Теперь это просьба самого пайплайна — без
+        зависимости от того, вспомнил ли составитель task.md. В shared пусто (коммитит человек)."""
+        if not self._is_worktree():
+            return ""
+        arts = self.state["artifacts_rel"]
+        return f"""Серия идёт в отдельном worktree: до слияния её раскладывают на коммиты командой `commit-by-plan`, а она
+читает отчёт с разметкой. Поэтому в ПОСЛЕДНЕМ вызове (перед SOLO_DONE) запиши `{arts}/impl_report_v1.md`:
+что сделано; изменённые/созданные файлы; команды проверок и результат; и в самом КОНЦЕ секцию `## commit_plan` —
+таблицу с заголовком СТРОГО из четырёх колонок:
+| группа | файлы (glob) | сообщение коммита (1 строка) | rationale |
+Правила: заголовок секции ровно `## commit_plan`; в колонке «файлы» КАЖДЫЙ путь/glob — в СВОИХ бэктиках, несколько —
+через запятую (`a.sh`, `b.sh`; НЕ `a.sh b.sh` в одном спане); пути от корня репозитория; каждый изменённый
+файл — ровно в одной группе; файлы артефактов серии (`{arts}/…`) в группы не включай. Не делай git commit.
+"""
 
 
 # ----------------------------------------------------------------------------
@@ -3441,10 +3812,21 @@ class Pipeline:
             phase=phase,
         )
 
+    def _charge_review(self, st: dict, err: BaseException) -> None:
+        """Н42: ревью оборвалось исключением, но модель уже была оплачена (отброшенные попытки, R1–R3).
+        DuoReviewer.review прикладывает к исключению `review_cost`; здесь он попадает в бюджет серии —
+        иначе такие траты были невидимы для `check_budget` и `status`."""
+        c = float(getattr(err, "review_cost", 0.0) or 0.0)
+        if c > 0:
+            st["spent_usd"] = round(float(st.get("spent_usd", 0.0) or 0.0) + c, 4)
+            log(self.task_dir, f"БЮДЖЕТ: ревью оборвалось ({type(err).__name__}), в spent_usd учтено ${c:.2f} "
+                               f"уже потраченного")
+
     def _halt_empty_review(self, st: dict, phase: str, err: Exception) -> None:
         """Guard пустого ревью (29.10.2026): проверяющий вернул ACCEPT, не обратившись к инструментам,
         и повтор не помог — вердикт не засчитан, rev-файл не записан (номер возвращает halt()).
         Транскрипты попыток — transcripts/*_reviewer_*_empty*.md и итоговый."""
+        self._charge_review(st, err)
         self.halt(
             st, "review_empty",
             f"ревью фазы {phase} ПУСТОЕ: {err}; вердикт ACCEPT не засчитан (повтор с напоминанием не помог). "
@@ -4006,7 +4388,7 @@ class Pipeline:
             st["errata_applied"] = {"rev": last["rev"], "plan": plan_path.name, **info,
                                     "at": datetime.now().isoformat(timespec="seconds")}
             log(self.task_dir, f"ЭРРАТЫ: блок {last['rev']} дописан в {arts_rel}/{plan_path.name} "
-                               f"({info['items']} пунктов, sha256:{info['sha']})")
+                               f"({errata_count_text(info)}, sha256:{info['sha']})")
         elif status == "present":
             log(self.task_dir, f"ЭРРАТЫ: блок {last['rev']} уже в {plan_path.name} — без изменений")
         else:
@@ -4074,8 +4456,14 @@ class Pipeline:
                       f"`run --task {self.task} --resume --add-budget USD`")
         except RuntimeError as e:
             st = self._live_state or self.load_state()
-            self.halt(st, "transport", f"сбой вызова модели после повторов: {e}. "
-                      f"Продолжить: `run --task {self.task} --resume`")
+            self._charge_review(st, e)        # Н42: цена оборванного ревью — в spent_usd
+            if isinstance(e, ReviewIncompleteError):
+                # Н38: ревью не получило ответа модели (перегрузка провайдера / лимит вывода) — НЕ вердикт
+                self.halt(st, e.kind, f"ревью не получило пригодного ответа модели: {e}. "
+                          f"Продолжить: `run --task {self.task} --resume`")
+            else:
+                self.halt(st, "transport", f"сбой вызова модели после повторов: {e}. "
+                          f"Продолжить: `run --task {self.task} --resume`")
         except Exception as e:
             traceback.print_exc()
             st = self._live_state or self.load_state()
@@ -4717,6 +5105,29 @@ def is_foreign_series_artifact(repo: Path, path: str, artifacts_rel: str) -> boo
     return (d / "task.md").exists() or (d / "state.json").exists()
 
 
+def pick_report_version(task_dir: Path, default: int) -> int:
+    """Н35: у solo-серии `impl_version` остаётся 0 (имплементацию ведёт один вызов без версионной
+    петли), а исполнитель по заданию пишет `impl_report_v1.md` — `commit-by-plan` без `--version 1`
+    упирался в «файл отчёта не найден». Без явного `--version`: берём `default`, если файл есть, иначе
+    самый свежий `impl_report_vN.md` серии; нет ни одного — `default` (прежнее сообщение «не найден»)."""
+    if (Path(task_dir) / f"impl_report_v{default}.md").exists():
+        return default
+    found = [int(m.group(1)) for f in Path(task_dir).glob("impl_report_v*.md")
+             if (m := re.fullmatch(r"impl_report_v(\d+)\.md", f.name))]
+    return max(found) if found else default
+
+
+def spaced_globs_hint(group: dict) -> str:
+    """Н43: в ячейке «файлы (glob)» несколько путей написаны в ОДНОМ бэктик-спане через пробел
+    (`a.sh b.sh`) — парсер берёт спан целиком как один glob с пробелом, он ничего не находит, и группа
+    выглядит «пустой» без объяснения. Пробел в пути законен, поэтому спан не режем — подсказываем."""
+    spaced = [g for g in (group.get("globs") or []) if re.search(r"\s", str(g))]
+    if not spaced:
+        return ""
+    return (f"\n    подсказка: в glob есть пробел ({', '.join(repr(g) for g in spaced[:3])}) — если это несколько "
+            f"путей, впиши каждый в СВОИХ бэктиках через запятую: `a.sh`, `b.sh` (иначе glob — один путь с пробелом)")
+
+
 def collect_commit_groups(repo: Path, task_dir: Path, version: int, artifacts_rel: str,
                           worktree_links: tuple[str, ...] | list[str] = ()) -> dict:
     """Снимок для commit-by-plan (чистая функция для юнитов).
@@ -5027,6 +5438,12 @@ def cmd_commit_by_plan(cfg: dict, args) -> None:
     p = Pipeline(cfg, args.task)  # только разрешение путей и state.json
     st = p.load_state()
     version = args.version or st.get("impl_version", 0)
+    if not args.version:
+        picked = pick_report_version(p.task_dir, version)
+        if picked != version:
+            print(f"версия отчёта не задана: impl_report_v{version}.md нет — беру самый свежий "
+                  f"impl_report_v{picked}.md (задать явно: --version N)")
+            version = picked
     arts_rel = f"{cfg['artifacts_dir']}/{args.task}"
     yes_all = bool(getattr(args, "yes", False))  # pipev4: --yes = подтверждение всех групп без интерактива
     # pipev3 P2: снимок и коммиты — по дереву серии (worktree), а не p.repo
@@ -5070,7 +5487,7 @@ def cmd_commit_by_plan(cfg: dict, args) -> None:
                 print(f"    {f}{'  (untracked)' if f in untracked else ''}")
             if not files:
                 print("    (артефакты серии — коммитятся отдельно)" if artifact_only_group(g, arts_rel)
-                      else "    (нет изменённых файлов под глобами группы)")
+                      else "    (нет изменённых файлов под глобами группы)" + spaced_globs_hint(g))
         staged = staged_paths(p.work_path)
         if staged:
             print()
@@ -5118,7 +5535,8 @@ def cmd_commit_by_plan(cfg: dict, args) -> None:
             artifact_groups.append(g["name"])
             continue
         if not files:
-            print("    нет изменённых файлов под глобами группы — пустой коммит не создаём, пропуск")
+            print("    нет изменённых файлов под глобами группы — пустой коммит не создаём, пропуск"
+                  + spaced_globs_hint(g))
             empty.append(g["name"])
             continue
         fresh = [f for f in files if f in untracked]
@@ -5478,7 +5896,7 @@ def format_status_table(rows: list[dict]) -> str:
 def accepted_plan_summary(st: dict) -> str | None:
     """Сводка «что принято» для момента решения о запуске имплементации (Н11 полевой проверки):
     версия плана, ревью-приёмка, эрраты, зона записи, потрачено. Только уже имеющиеся поля state —
-    ничего не вычисляет заново (число эррат — `errata_applied.items`, его пишет оркестратор при дописывании).
+    ничего не вычисляет заново (число эррат — `errata_applied.top_items`/`items`, их пишет оркестратор при дописывании).
     None — плана ещё нет."""
     pv = int(st.get("plan_version", 0) or 0)
     if pv <= 0:
@@ -5488,7 +5906,7 @@ def accepted_plan_summary(st: dict) -> str | None:
     parts = [f"план v{pv} принят" + (f" ревью {rev}" if rev else " (вердикт ACCEPT в state не найден)")]
     er = st.get("errata_applied")
     if isinstance(er, dict) and er.get("plan") == f"plan_v{pv}.md":
-        parts.append(f"эрраты: {er.get('items', '?')} п. из {er.get('rev', '?')} дописаны в план")
+        parts.append(f"эрраты: {errata_count_text(er)} из {er.get('rev', '?')} дописаны в план")
     else:
         parts.append("эрраты оркестратором не дописывались")
     claim = st.get("claim")
@@ -5558,6 +5976,8 @@ def cmd_status(cfg: dict, args) -> None:
     stubs = sum(int(t.get("stub_retries", 0) or 0) for t in tel)
     tretry = sum(int(t.get("transport_retries", 0) or 0) for t in tel)
     empty = sum(int(t.get("empty_retries", 0) or 0) for t in tel)
+    extra_ev = {k: sum(int(t.get(k, 0) or 0) for t in tel)
+                for k in ("incomplete_retries", "overload_retries", "limit_retries", "stitched")}
     wt = p.isolation == "worktree"
     deny = executor_deny_rules(cfg)
     res_names = sorted({str(n) for n in (cfg.get("resources") or []) if isinstance(n, str)})
@@ -5578,7 +5998,7 @@ def cmd_status(cfg: dict, args) -> None:
             "halt": info.get("halt") or None, "stop_reason": info.get("stop_reason") or None,
             "accepted_plan": summ if st.get("phase") in ("impl_pending", "impl", "done") else None,
             "review_transport": {"stub_retries": stubs, "transport_retries": tretry,
-                                 "empty_retries": empty, "reviews": len(tel)},
+                                 "empty_retries": empty, "reviews": len(tel), **extra_ev},
             "guard": {"executor_deny": deny, "resources": res_state},
             "models": models_summary(cfg, st.get("mode") or "duo", st.get("executor_model") or ""),
             "waiting": waiting_info(st),
@@ -5638,9 +6058,12 @@ def cmd_status(cfg: dict, args) -> None:
         if st.get("phase") == "impl_pending":
             print(f"решение за человеком: прочти plan_v{st.get('plan_version')}.md и эрраты, затем "
                   f"`duo run --task {args.task} --continue`")
-    if stubs or tretry or empty:
+    if stubs or tretry or empty or any(extra_ev.values()):
         print(f"транспорт ревью (деградации, на вердикт обычно не влияют): ответов-заглушек {stubs}, "
-              f"транспортных повторов {tretry}, пустых ревью {empty} — по {len(tel)} ревью")
+              f"транспортных повторов {tretry}, пустых ревью {empty}, ретраев формата "
+              f"{extra_ev['incomplete_retries']}, пауз на перегрузку {extra_ev['overload_retries']}, "
+              f"ретраев после лимита вывода {extra_ev['limit_retries']}, склеек {extra_ev['stitched']} "
+              f"— по {len(tel)} ревью")
 
 
 def cmd_accept(cfg: dict, args) -> int:

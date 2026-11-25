@@ -48,8 +48,9 @@
     "executor_api_retries": 3,
     "executor_continue_retries": 2,
     "reviewer_retries": 2,
+    "overload_retries": 4,
     "budget_grace_usd": 15.0,
-    "_comment": "pipework3 (21.10.2026): лимит итераций и бюджет проверяются на ГРАНИЦЕ итерации — после ревью+синтеза председателя, перед работой исполнителя (уже сделанная версия всегда доходит до вердикта); budget_grace_usd — запас на доведение начатого ревью; повторы: executor_api_retries (транспорт исполнителя), executor_continue_retries (артефакт не записан), reviewer_retries (ревьюеры/председатель). Подъём лимита серии без правки файла: run --continue --add-iterations N / --add-budget USD"
+    "_comment": "pipework3 (21.10.2026): лимит итераций и бюджет проверяются на ГРАНИЦЕ итерации — после ревью+синтеза председателя, перед работой исполнителя (уже сделанная версия всегда доходит до вердикта); budget_grace_usd — запас на доведение начатого ревью; повторы: executor_api_retries (транспорт исполнителя), executor_continue_retries (артефакт не записан), reviewer_retries (ревьюеры/председатель: сбой транспорта claude), overload_retries (Н38: паузы 30/60/120/240 с при перегрузке провайдера «API Error: 529 … overloaded» — формат отчёта тут ни при чём, повтор без паузы бесполезен). Подъём лимита серии без правки файла: run --continue --add-iterations N / --add-budget USD"
   },
   "timeouts": {
     "executor_sec": 1200,
@@ -63,6 +64,10 @@
     "CLAUDE_STREAM_IDLE_TIMEOUT_MS": "900000",
     "CLAUDE_BYTE_STREAM_IDLE_TIMEOUT_MS": "900000",
     "_comment": "только исполнитель (mode=full); пол встроенного idle-watchdog стрима claude CLI = 300 с → «API Error: The operation timed out.» на длинных генерациях через Z.AI (боевой инцидент 17.10.2026, дважды: обрыв через 245 и 284 с тишины)"
+  },
+  "claude_env_plan": {
+    "CLAUDE_CODE_MAX_OUTPUT_TOKENS": "64000",
+    "_comment": "только ревьюеры и председатель (mode=plan) (Н38). Лимит вывода claude CLI по умолчанию — 32000 токенов НА РАССУЖДЕНИЯ И ТЕКСТ вместе; glm-5.4 на effort high в финальном синтезе думает 105–118 тыс. знаков и упирался в него: «API Error: … exceeded the 32000 output token maximum» либо отчёт обрывался на полуслове (полевая волна 1: 6 из 9 «неполных отчётов», $4+ за попытку). 64000 в поле: 5/5 ревью без обрывов. Если и этого мало — `effort.opus: medium` (рассуждения ≈1/8 по длине при том же формате и тех же находках, синтетика 25.11.2026)"
   },
   "git": {
     "auto_branch": true,
@@ -93,7 +98,7 @@
     ],
     "max_resumes": 3,
     "resume_window_sec": 21600,
-    "_comment": "штатный надзор: `duo_pipeline.py supervise` (systemd-timer, см. systemd/) — dead/halted → алерт; авто-возобновляются ТОЛЬКО transport/crash (потолок max_resumes за окно); limit/budget/errata/artifact_missing — решение человека"
+    "_comment": "штатный надзор: `duo_pipeline.py supervise` (systemd-timer, см. systemd/) — dead/halted → алерт; авто-возобновляются ТОЛЬКО transport/crash (потолок max_resumes за окно); limit/budget/errata/artifact_missing/review_empty/review_incomplete — решение человека"
   },
   "notify": {
     "desktop": true

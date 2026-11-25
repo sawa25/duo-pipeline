@@ -533,7 +533,8 @@ def test_pipeline_applies_chairman_errata_at_plan_accept(tmp_path: Path):
     plan = (td / "plan_v1.md").read_text(encoding="utf-8")
     assert "CALLER_PORT_ZZ" in plan and "ZZ_EMPTY_DIR" in plan
     assert st["errata_applied"]["rev"] == "rev001_plan.md" and st["errata_applied"]["items"] == 2
-    assert "ЭРРАТЫ: блок rev001_plan.md дописан" in (td / "orchestrator.log").read_text(encoding="utf-8")
+    log_text = (td / "orchestrator.log").read_text(encoding="utf-8")
+    assert "ЭРРАТЫ: блок rev001_plan.md дописан" in log_text and "(2 п., sha256:" in log_text
 
 
 def test_pipeline_errata_failure_halts_not_resumable(tmp_path: Path):

@@ -117,6 +117,15 @@ def _zone_verdict(path: str, root: Path, zones: list[str], plan_zone: list[str] 
     absolute = path if os.path.isabs(path) else os.path.join(str(root), path)
     rel = os.path.relpath(os.path.normpath(absolute), str(root))
     if rel == ".." or rel.startswith(".." + os.sep):
+        # Н41: каталог артефактов серии в worktree — СИМЛИНК на каталог основного дерева, и исполнитель
+        # вправе писать в него реальным (основного дерева) путём: по строкам пути он «вне дерева», по
+        # разворачиванию симлинка — ровно в разрешённой зоне. Разрешаем только то, что лежит внутри
+        # развёрнутой разрешённой зоны (произвольная запись в основное дерево по-прежнему нарушение).
+        real = os.path.realpath(absolute)
+        for z in zones:
+            zreal = os.path.realpath(os.path.join(str(root), z))
+            if real == zreal or real.startswith(zreal + os.sep):
+                return None
         return "вне дерева серии"
     if any(rel == z or rel.startswith(z + os.sep) for z in zones):
         return None

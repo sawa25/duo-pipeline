@@ -107,7 +107,11 @@ duo merge --task NAME --dry-run && duo merge --task NAME --yes   # только 
 ```
 
 `solo`: `duo init --task NAME`, затем `duo run --task NAME --solo` (план и ревью пропускаются;
-итог — `solo_report.md`).
+итог — `solo_report.md`). `solo --worktree`: исполнитель по просьбе пайплайна пишет `impl_report_v1.md` с `## commit_plan`
+(путь до `main`: `commit-by-plan` без `--version` берёт самый свежий отчёт → `gates` → `merge`; несколько путей в ячейке
+«файлы» — каждый в своих бэктиках через запятую).
+«Проверяющий вернул неполный отчёт» — не про формат: у каждой непринятой попытки в журнале есть класс (`output_limit`,
+`transient`, `api_error`, `stub`, `format`); разбор и счётчики — `CHEATSHEET-CONTROL.md`, раздел «Восстановление серии и защиты от типовых отказов».
 Состояние: `duo status --task NAME` / `duo status --all`; логи — `pipeline/NAME/orchestrator.log`.
 Для скриптов — `duo status --task NAME --json` (ровно один JSON-объект); обычный вывод `--task` — JSON и текст подряд,
 `json.load` на нём падает.

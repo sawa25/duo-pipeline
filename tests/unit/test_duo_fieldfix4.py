@@ -433,17 +433,45 @@ class _PacedProc:
         pass
 
 
-def test_transport_heartbeat_timer_resets_on_every_event(tmp_path: Path, monkeypatch, capsys):
-    # без сброса таймера после события пульс «просрочивался» бы за время потока и печатал «тишина 0 с»
-    # посреди работающей модели — шум, который учит оператора игнорировать пульс
-    events = [{"type": "assistant", "session_id": "s", "message": {"content": [{"type": "text", "text": "…"}]}}
-              for _ in range(8)]
-    events.append({"type": "result", "session_id": "s", "total_cost_usd": 0.0, "result": "ok"})
+def _paced_call(tmp_path: Path, monkeypatch, events: list[dict], gap: float = 0.1, beat: float = 0.25):
+    events = events + [{"type": "result", "session_id": "s", "total_cost_usd": 0.0, "result": "ok"}]
     monkeypatch.setattr(duo, "TRANSPORT_POLL_SEC", 0.02)
-    monkeypatch.setattr(duo, "TRANSPORT_HEARTBEAT_SEC", 0.25)
-    monkeypatch.setattr(duo.subprocess, "Popen", lambda *a, **k: _PacedProc(events, 0.1))   # поток ≈0.9 с > 0.25 с
+    monkeypatch.setattr(duo, "TRANSPORT_HEARTBEAT_SEC", beat)
+    monkeypatch.setattr(duo.subprocess, "Popen", lambda *a, **k: _PacedProc(events, gap))   # поток ≈0.9 с > 0.25 с
     glm = duo.ClaudeGlm({"claude_config_dir": str(tmp_path), "model": "m"})
     assert glm.call("p", mode="plan", timeout=60)[0] == "ok"
+    return glm
+
+
+def test_transport_heartbeat_follows_console_silence_not_stream_silence(tmp_path: Path, monkeypatch, capsys):
+    """Н40 (поле: 24 мин пустой консоли): пока модель думает, claude CLI шлёт `system/thinking_tokens`
+    десятками в секунду — поток не молчит, а консоль пуста. Пульс идёт по времени последнего ВЫВОДА, и в нём
+    видны оба времени и размер рассуждений (прежний тест требовал тишины пульса при живом потоке — это и был дефект)."""
+    # счётчик сбрасывается на каждом сообщении модели: пик (700) — не последнее значение (150)
+    events = [{"type": "system", "subtype": "thinking_tokens", "estimated_tokens": tk,
+               "estimated_tokens_delta": 100, "session_id": "s"} for tk in (100, 200, 300, 400, 500, 600, 700, 150)]
+    glm = _paced_call(tmp_path, monkeypatch, events)
+    beats = [ln for ln in capsys.readouterr().out.splitlines() if "жду ответ модели" in ln]
+    assert 2 <= len(beats) <= 5                      # пульс раз в интервал, а не на каждый опрос очереди
+    assert "без вывода" in beats[0] and "тишина потока 0 с" in beats[0] and "отсечка по тишине 60 с" in beats[0]
+    assert "рассуждений ≈" in beats[-1] and glm.take_call_meta()["thinking_tokens_peak"] == 700
+
+
+def test_transport_heartbeat_fires_even_when_stream_never_pauses(tmp_path: Path, monkeypatch, capsys):
+    """Боевая форма Н40: события идут каждые единицы миллисекунд — очередь не пустеет ни разу (ветка
+    queue.Empty не выполняется), и пульс обязан выйти из обработки событий, а не из ожидания."""
+    events = [{"type": "system", "subtype": "thinking_tokens", "estimated_tokens": 10 * (i + 1),
+               "estimated_tokens_delta": 10, "session_id": "s"} for i in range(150)]
+    _paced_call(tmp_path, monkeypatch, events, gap=0.004, beat=0.2)           # поток ≈0.6 с без пауз
+    beats = [ln for ln in capsys.readouterr().out.splitlines() if "жду ответ модели" in ln]
+    assert 1 <= len(beats) <= 4 and "тишина потока 0 с" in beats[0] and "рассуждений ≈" in beats[0]
+
+
+def test_transport_heartbeat_is_quiet_while_console_prints(tmp_path: Path, monkeypatch, capsys):
+    """Каждая строка вызова инструмента сбрасывает таймер пульса: пока консоль живая, пульс — шум."""
+    events = [{"type": "assistant", "session_id": "s", "message": {"id": f"m{i}", "content": [
+        {"type": "tool_use", "name": "Read", "input": {"file_path": f"/x{i}"}}]}} for i in range(8)]
+    _paced_call(tmp_path, monkeypatch, events)
     assert "жду ответ модели" not in capsys.readouterr().out
 
 

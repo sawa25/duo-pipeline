@@ -68,7 +68,7 @@ duo supervise --dry-run   # что сделал бы надзор (ничего 
 - `KillMode=process` в `duo-supervise.service` — обязателен: иначе systemd убьёт вместе с oneshot-сервисом
   оркестратор, который supervise запустил detached;
 - авто-возобновляются **только** `transport`/`crash` (`supervisor.auto_resume_kinds`); `limit`, `budget`,
-  `errata`, `artifact_missing`, эскалации — решение человека (алерт без запуска); потолок —
+  `errata`, `artifact_missing`, `review_empty`, `review_incomplete`, эскалации — решение человека (алерт без запуска); потолок —
   `supervisor.max_resumes` за `resume_window_sec` на задачу (защита от платного цикла);
 - «мёртв» = активная фаза + `.lock` свободен + state не обновлялся ≥ `supervisor.stale_sec` (300 с) и не старше
   `dead_max_age_sec` (сутки: давние «трупы» и ни разу не запускавшиеся серии — `idle`, не тревога);
