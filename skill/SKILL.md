@@ -173,3 +173,14 @@ Python-проект: `__pycache__/` должен быть в `.gitignore` и з�
 - Бюджет серии — `limits.budget_usd` (+ `--add-budget`). Лимит итераций по умолчанию в `config.json`.
 - Модель ходит через профиль `~/.claude-glm` (Z.AI); `duo selftest` — один дешёвый вызов
   для проверки транспорта.
+- **Остановка по квоте провайдера** (`429 [1308]`: `halt transport`, `cause=quota`, время сброса в `status`/`wait`) — не перегрузка:
+  ждать **сброса**, не 10–15 минут. Продолжить: `duo run --task NAME --resume --wait-quota` (сам дождётся) либо надзор с
+  `auto_resume`. `halt kind=env` — нет `claude`/`node` в PATH процесса: чинить окружение (PATH службы, `claude_bin`), затем `--resume`.
+- **Перед `supervisor.auto_resume` проверь окружение службы надзора** (`env -i PATH=<PATH службы> sh -c 'command -v claude; command -v node'`):
+  без `node` возобновление падает за минуты. Серии с тяжёлыми прогонами тестов — `parallel.isolate_cgroup` + `memory_max`
+  (OOM убьёт область серии, а не IDE); лимиты прогона тестов — в `task.md`.
+- **`dead` и деньги:** алерт о смерти оркестратора содержит диагноз; оборванные вызовы модели оплачены, но не входят в
+  `spent_usd` — `status` показывает «неучтённых оборванных вызовов». Второй канал уведомлений — `notify.command`.
+- **`gates.steps[].idle_timeout`** (сек тишины вывода) защищает от зависшего шага; **диф для ревью** (`diff_impl_vN.patch`)
+  включает новые файлы, `diff_delta_vN.patch` — изменения после прошлого ревью. Подробности — `CHEATSHEET-CONTROL.md`,
+  «Восстановление серии…».

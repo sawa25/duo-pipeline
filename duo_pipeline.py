@@ -109,6 +109,7 @@ import queue
 import re
 import shlex
 import shutil
+import signal
 import subprocess
 import sys
 import tarfile
@@ -118,7 +119,7 @@ import time
 import traceback
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta, timezone
 from pathlib import Path
 
 # ----------------------------------------------------------------------------
@@ -165,6 +166,13 @@ DEFAULTS = {
     "parallel": {
         "shared_ok": [],                # globs «горячих» файлов, пересечение по которым не блокирует
         "sync_base_at_impl": True,      # перед первой имплементацией подтянуть базу worktree к HEAD основного дерева (только fast-forward, только при чистом worktree)
+        # Н51/Н52: оркестратор (и всё его дерево: claude, тесты исполнителя) — в собственной transient-области
+        # systemd (`systemd-run --user --scope`): гибель родителя (OOM убил Cursor) его не уносит, а memory_max /
+        # memory_swap_max ограничивают runaway-тесты исполнителя, не давая им съесть хост. По умолчанию выкл.
+        # (нужен systemd --user); значения — как у systemd: `8G`, `512M`, `50%`, `infinity`, число байт
+        "isolate_cgroup": False,
+        "memory_max": "",               # MemoryMax= области; пусто — без лимита
+        "memory_swap_max": "",          # MemorySwapMax= области; пусто — без лимита
     },
     "limits": {
         "max_plan_iterations": 4,
@@ -236,6 +244,8 @@ DEFAULTS = {
     "review": {
         "context": "legacy",             # pipev3 P1 (A3-lite): legacy | hybrid
         "pack_max_chars": 60000,
+        # Н45: новые файлы крупнее этого размера (КиБ) не входят в diff_impl_vN.patch (дампы, данные)
+        "snapshot_max_file_kb": 512,
         "plan_policy": "triage",         # triage | legacy: фаза plan по блокерам, эрраты не блокируют (PLAN_POLICY_*)
         "impl_policy": "strict",         # strict | legacy: факт-вывод тестов в отчёте, фикс класса дефекта (IMPL_POLICY_*)
         # guard пустого ревью (pair, 29.10.2026; боевой инцидент: ACCEPT без единого чтения файла).
@@ -261,9 +271,18 @@ DEFAULTS = {
         "auto_resume": False,           # supervise сам перезапускает умершие/остановленные (см. kinds)
         "auto_resume_kinds": ["transport", "crash"],   # какие halt можно возобновлять без человека
         "max_resumes": 3,               # потолок авто-возобновлений на задачу за resume_window_sec
+        # Н46: остановка по квоте провайдера (halt.cause=quota) возобновляется ПОСЛЕ сброса и считается отдельно —
+        # ожидание сброса не расходует max_resumes; этот потолок — лишь от петли «метка сброса врёт»
+        "max_quota_resumes": 4,
         "resume_window_sec": 21600,
     },
-    "notify": {"desktop": False},       # notify-send при остановке (в config.json — true)
+    # Н46/Н58: квота провайдера («429 [1308] Usage limit reached … reset at <метка>»). Метка — время пояса
+    # провайдера; resume_margin_sec — запас после метки; max_wait_sec — потолок `run --resume --wait-quota`
+    "quota": {"provider_utc_offset_hours": 8, "resume_margin_sec": 90, "max_wait_sec": 21600},
+    # notify-send при остановке (в config.json — true); command — ВТОРОЙ канал (Н54): argv внешней команды
+    # (почта/мессенджер/webhook — на стороне оператора, инструмент сам в сеть не ходит), `{title}`/`{body}` в
+    # аргументах подставляются, те же значения — в DUO_NOTIFY_TITLE/DUO_NOTIFY_BODY; запуск без shell
+    "notify": {"desktop": False, "command": [], "command_timeout_sec": 20},
     # Н26 (полевой отчёт 20.11.2026): исполнитель идёт с --dangerously-skip-permissions, и «НЕ делай X» в
     # task.md — лишь просьба. Здесь — ТЕХНИЧЕСКИЕ запреты: правила `--disallowedTools` claude CLI
     # (`Bash(adb:*)`, `Read(./.env)`, `Edit(./config/**)`…), действуют и в bypass-режиме (проверено
@@ -364,6 +383,50 @@ def guard_config_problems(cfg: dict) -> list[str]:
         v = lim["overload_retries"]
         if isinstance(v, bool) or not isinstance(v, int) or v < 0:
             bad.append(f"limits.overload_retries: ожидается целое ≥ 0, не {v!r}")
+    # Н46: опечатка в поясе провайдера сдвинула бы возобновление на часы (в поле — на 8) — не молча
+    q = cfg.get("quota")
+    if q is not None:
+        if not isinstance(q, dict):
+            bad.append("quota должен быть объектом")
+        else:
+            for k, lo, hi in (("provider_utc_offset_hours", -14, 14), ("resume_margin_sec", 0, 86400),
+                              ("max_wait_sec", 0, 7 * 86400)):
+                if k in q:
+                    v = q[k]
+                    if isinstance(v, bool) or not isinstance(v, (int, float)) or not (lo <= v <= hi):
+                        bad.append(f"quota.{k}: ожидается число в [{lo}, {hi}], не {v!r}")
+    gt = cfg.get("gates")
+    if isinstance(gt, dict) and isinstance(gt.get("steps"), list):
+        for i, stp in enumerate(gt["steps"]):
+            if isinstance(stp, dict) and "idle_timeout" in stp:
+                v = stp["idle_timeout"]
+                if isinstance(v, bool) or not isinstance(v, (int, float)) or v <= 0:
+                    bad.append(f"gates.steps[{i}] ({stp.get('name', '?')}).idle_timeout: ожидается число секунд > 0, "
+                               f"не {v!r}")
+    nt = cfg.get("notify")
+    if isinstance(nt, dict) and nt.get("command") not in (None, [], ""):
+        c = nt["command"]
+        if not isinstance(c, list) or not c or not all(isinstance(x, str) and x.strip() for x in c):
+            bad.append(f"notify.command: ожидается непустой список строк (argv без shell), не {c!r}")
+        t = nt.get("command_timeout_sec", 20)
+        if isinstance(t, bool) or not isinstance(t, (int, float)) or t <= 0:
+            bad.append(f"notify.command_timeout_sec: ожидается число > 0, не {t!r}")
+    par = cfg.get("parallel")
+    if isinstance(par, dict):
+        if "isolate_cgroup" in par and not isinstance(par["isolate_cgroup"], bool):
+            bad.append(f"parallel.isolate_cgroup: ожидается true/false, не {par['isolate_cgroup']!r}")
+        for k in ("memory_max", "memory_swap_max"):
+            v = par.get(k)
+            if v in (None, ""):
+                continue
+            if isinstance(v, bool) or not isinstance(v, (str, int)) or not CGROUP_SIZE_RE.fullmatch(str(v).strip()):
+                bad.append(f"parallel.{k}: ожидается размер systemd (`8G`, `512M`, `50%`, `infinity`, число байт), "
+                           f"не {v!r}")
+    sv = cfg.get("supervisor")
+    if isinstance(sv, dict) and "max_quota_resumes" in sv:
+        v = sv["max_quota_resumes"]
+        if isinstance(v, bool) or not isinstance(v, int) or v < 0:
+            bad.append(f"supervisor.max_quota_resumes: ожидается целое ≥ 0, не {v!r}")
     return bad
 
 
@@ -596,6 +659,70 @@ class ReviewIncompleteError(RuntimeError):
         self.review_cost = cost
 
 
+class QuotaExhaustedError(ReviewIncompleteError):
+    """Квота провайдера исчерпана (429 [1308], Н46/Н58): ни исполнитель, ни ревьюер не могут продолжить до
+    сброса. Повторы бесполезны, поэтому — сразу остановка `transport` с `halt.cause=quota` и `reset_at`
+    (UTC epoch либо None, если метки в ответе нет); возобновление — после сброса (`run --resume
+    --wait-quota` либо надзор). `review_cost` — цена оборванного ревью (у исполнителя 0: она уже в state)."""
+
+    def __init__(self, msg: str, *, reset_at: float | None = None, cost: float = 0.0):
+        super().__init__(msg, kind="transport", cost=cost)
+        self.reset_at = reset_at
+
+
+def quota_error(cfg: dict, who: str, text: str, cost: float = 0.0) -> QuotaExhaustedError:
+    """Исключение о квоте по тексту ответа провайдера (общий конструктор исполнителя и ревью)."""
+    reset = parse_quota_reset(text, quota_cfg(cfg)["provider_utc_offset_hours"])
+    return QuotaExhaustedError(f"{who}: квота провайдера исчерпана ({(text or '').strip()[:200]})",
+                               reset_at=reset, cost=cost)
+
+
+class EnvironmentProblem(RuntimeError):
+    """Окружение процесса не позволяет вызвать модель (Н50): `claude` (или интерпретатор его shebang —
+    `node`) не найден в PATH. Это НЕ транспортный сбой: повторы и паузы бесполезны, а прежняя классификация
+    `crash` сжигала max_resumes надзора за минуты (урезанный PATH службы systemd --user). Pipeline.run
+    переводит её в halt kind=env: надзор такие остановки не возобновляет (только алерт)."""
+
+
+def claude_executable(cfg: dict) -> str:
+    """Что запускать как `claude`: `claude_bin` конфига (имя или путь, `~` раскрывается) либо `claude`."""
+    return os.path.expanduser(str(cfg.get("claude_bin") or "claude"))
+
+
+def claude_env_problem(cfg: dict, path_env: str | None = None) -> str | None:
+    """Предполётная проверка окружения (Н50): None — `claude` запустится; иначе — понятная причина.
+    Проверяет и сам исполняемый файл, и интерпретатор из его shebang (`#!/usr/bin/env node`): npm-установка
+    `claude` — скрипт, при урезанном PATH службы он находится, а `node` — нет, и exec падает тем же
+    `FileNotFoundError`. Без вызова модели и без сети; бинарные (не скриптовые) `claude` проверки shebang
+    не требуют."""
+    name = claude_executable(cfg)
+    path_env = os.environ.get("PATH", "") if path_env is None else path_env
+    shown = path_env if len(path_env) <= 200 else path_env[:200] + "…"
+    exe = shutil.which(name, path=path_env)
+    if not exe:
+        return (f"`{name}` не найден в PATH ({shown or 'PATH пуст'}). Задай `claude_bin` (абсолютный путь) в "
+                f".duo/config.json либо PATH службы (`Environment=PATH=…` в unit-файле надзора)")
+    try:
+        with open(exe, "rb") as fh:
+            head = fh.readline(300)
+    except OSError:
+        return None                                          # не читается — не блокируем: пусть скажет сам exec
+    if not head.startswith(b"#!"):
+        return None
+    toks = head[2:].decode("utf-8", "replace").split()
+    if not toks:
+        return None
+    interp = toks[0]
+    if os.path.basename(interp) == "env":                  # `#!/usr/bin/env [-S] node …` → node
+        rest = [t for t in toks[1:] if not t.startswith("-") and "=" not in t]
+        interp = rest[0] if rest else ""
+    if interp and not shutil.which(interp, path=path_env):
+        return (f"`{name}` найден ({exe}), но его интерпретатор `{interp}` (shebang) недоступен в PATH "
+                f"({shown or 'PATH пуст'}) — exec упадёт тем же «No such file or directory». Добавь каталог "
+                f"`{interp}` в PATH службы (`Environment=PATH=…`) либо поставь бинарный `claude`")
+    return None
+
+
 class ClaudeTransportError(RuntimeError):
     """Транспортный сбой claude CLI: idle-kill (нет событий stream-json) либо завершение без
     result-события. pipework3: несёт session_id (приходит в любом событии потока) и
@@ -752,8 +879,9 @@ def load_json(path: Path) -> dict:
     return json.loads(path.read_text(encoding="utf-8"))
 
 
-def sh(cmd: list[str], cwd: Path | None = None, timeout: int = 120) -> tuple[int, str]:
-    p = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True, timeout=timeout)
+def sh(cmd: list[str], cwd: Path | None = None, timeout: int = 120, *,
+       env: dict | None = None, stdin: str | None = None) -> tuple[int, str]:
+    p = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True, timeout=timeout, env=env, input=stdin)
     return p.returncode, (p.stdout or "") + (p.stderr or "")
 
 
@@ -891,7 +1019,7 @@ class ClaudeGlm:
         """
         alias = model or (role_model(self.cfg, role, persona) if role else self.model)
         effort = effort if effort in EFFORT_LEVELS else role_effort(self.cfg, alias)
-        cmd = ["claude", "-p"]
+        cmd = [claude_executable(self.cfg), "-p"]
         deny = executor_deny_rules(self.cfg) if mode == "full" else []
         if deny:
             # Н26. `--disallowedTools` — ВАРИАДИЧЕСКАЯ опция: без следующего за ней флага она «съест»
@@ -910,10 +1038,16 @@ class ClaudeGlm:
             cmd += ["--resume", resume_session]
         cmd.append(prompt)
         idle_limit = timeout
-        proc = subprocess.Popen(
-            cmd, cwd=cwd, env=self._base_env(mode, env_extra),
-            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
-        )
+        try:
+            proc = subprocess.Popen(
+                cmd, cwd=cwd, env=self._base_env(mode, env_extra),
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+            )
+        except FileNotFoundError as e:
+            if str(e.filename) != str(cmd[0]):
+                raise                                          # нет каталога cwd и т.п. — не «окружение claude»
+            # Н50: не `crash` и не транспортный ретрай — окружение; текст объясняет, что именно не найдено
+            raise EnvironmentProblem(claude_env_problem(self.cfg) or f"не удалось запустить `{cmd[0]}`: {e}") from e
         out_q: queue.Queue[str | None] = queue.Queue()
 
         def reader():
@@ -1203,9 +1337,76 @@ class GitGuard:
             sh(["git", "checkout", "-b", branch], cwd=self.repo)
             log(task_dir, f"создана ветка {branch}")
 
-    def diff_patch(self, base: str, out_file: Path) -> None:
+    def snapshot_tree(self, artifacts_rel: str, max_file_kb: int = 512) -> str:
+        """Н45: git-tree текущего рабочего дерева серии — tracked-правки И НОВЫЕ (untracked) файлы,
+        без игнорируемых, без артефактов серии и без файлов крупнее max_file_kb. Строится через
+        ВРЕМЕННЫЙ индекс (копия настоящего): настоящие индекс и рабочее дерево не меняются. В объектную
+        базу попадают только висячие блобы/деревья (gc уберёт). '' — снимок не удался."""
+        rc, ip = sh(["git", "rev-parse", "--git-path", "index"], cwd=self.repo)
+        if rc != 0 or not ip.strip():
+            return ""
+        real = Path(ip.strip())
+        if not real.is_absolute():
+            real = Path(self.repo) / real
+        arts = artifacts_rel.rstrip("/")
+        cap = max(0, int(max_file_kb)) * 1024
+        new: list[str] = []
+        for xy, p in changed_status_all(self.repo):
+            if xy != "??" or is_artifact_path(p, arts):
+                continue
+            fp = Path(self.repo) / p
+            if fp.is_symlink() or (fp.is_file() and fp.stat().st_size <= cap):
+                new.append(p)
+        try:
+            with tempfile.TemporaryDirectory(prefix="duo-idx-") as td:
+                idx = Path(td) / "index"
+                if real.is_file():
+                    shutil.copyfile(real, idx)
+                env = {**os.environ, "GIT_INDEX_FILE": str(idx)}
+                rc, _ = sh(["git", "add", "-u", "--", ".", f":(exclude){arts}"], cwd=self.repo,
+                           timeout=180, env=env)
+                if rc != 0:
+                    return ""
+                if new:
+                    rc, _ = sh(["git", "update-index", "--add", "-z", "--stdin"], cwd=self.repo,
+                               timeout=180, env=env, stdin="\0".join(new) + "\0")
+                    if rc != 0:
+                        return ""
+                rc, out = sh(["git", "write-tree"], cwd=self.repo, env=env)
+        except (OSError, subprocess.SubprocessError):
+            return ""
+        tree = out.strip()
+        return tree if rc == 0 and re.fullmatch(r"[0-9a-f]{40,64}", tree) else ""
+
+    def diff_patch(self, base: str, out_file: Path, artifacts_rel: str = "",
+                   max_file_kb: int = 512) -> str:
+        """Дифф рабочего дерева относительно base в out_file. С artifacts_rel (путь каталога артефактов
+        серии) дифф строится по снимку (snapshot_tree) и ВКЛЮЧАЕТ новые файлы — иначе серия из новых
+        файлов давала патч 0 Б, и ревью читало всё с нуля (Н45, поле: 5 серий). Возвращает tree снимка
+        либо '' (старый путь `git diff base`: без artifacts_rel или снимок не удался)."""
+        if artifacts_rel:
+            tree = self.snapshot_tree(artifacts_rel, max_file_kb)
+            if tree:
+                rc, out = sh(["git", "diff", base, tree], cwd=self.repo, timeout=180)
+                if rc == 0:
+                    out_file.write_text(out, encoding="utf-8")
+                    return tree
         rc, out = sh(["git", "diff", base], cwd=self.repo, timeout=180)
         out_file.write_text(out, encoding="utf-8")
+        return ""
+
+    def diff_delta(self, tree_a: str, tree_b: str, out_file: Path) -> bool:
+        """Дельта итерации: что изменилось между двумя снимками (tree_a → tree_b). False — снимка нет
+        в базе (gc) либо git не смог: дельты не будет, полный дифф остаётся."""
+        for t in (tree_a, tree_b):
+            rc, _ = sh(["git", "cat-file", "-e", f"{t}^{{tree}}"], cwd=self.repo)
+            if rc != 0:
+                return False
+        rc, out = sh(["git", "diff", tree_a, tree_b], cwd=self.repo, timeout=180)
+        if rc != 0:
+            return False
+        out_file.write_text(out, encoding="utf-8")
+        return True
 
     def untracked_list(self, base_status_ignore: str, out_file: Path, artifacts_rel: str) -> None:
         st = self.status()
@@ -1251,7 +1452,7 @@ PLAN_POLICY_CHAIRMAN_BLOCK = """
 5. Дефект платформы вне фичи: если он воспроизводится и без этой фичи (в существующем пути кода), это не блокер плана и не работа плана. Запиши его в «К владельцу» и, если нужно, дай эрратой минимальную защиту фичи (проверка/ограничение v1); план не обязан чинить платформу.
 6. Антитредмилл: сверь замечания с последними `rev*_plan.md` каталога артефакта. Если предыдущее ревью уже дало БЛОКЕР в той же подсистеме, второй подряд блокер допустим только по п.3(а); иначе оформи эррату-РЕШЕНИЕ. Если дефект внесён правкой предыдущей итерации, сначала оцени откат этой правки как вариант.
 7. Размер плана: если за последнюю итерацию он вырос более чем на 5 % без нового требования ТЗ, потребуй в сводке вносить решения эрратами, а не вставками в тело, и назови, что вытеснено.
-8. «Сводка для исполнителя»: при REVISE — блокеры отдельно от эррат. При ACCEPT вместо «правок не требуется» выведи готовый блок `## Эрраты к плану` (заголовок СТРОГО такой, на своей строке; затем нумерованный список: `Е№ (серьёзность)`: координаты / что дописать или РЕШЕНИЕ / что заменяет; без заголовков уровня `##` и выше внутри блока) — оркестратор дословно допишет его в конец плана перед имплементацией; без этого блока эрраты потеряются.
+8. «Сводка для исполнителя»: при REVISE — блокеры отдельно от эррат. При ACCEPT вместо «правок не требуется» выведи готовый блок `## Эрраты к плану` (заголовок СТРОГО такой, на своей строке; затем нумерованный список: `Е№ (серьёзность)`: координаты / что дописать или РЕШЕНИЕ / что заменяет; без заголовков уровня `##` и выше внутри блока) — оркестратор дословно допишет его в конец плана перед имплементацией; без этого блока эрраты потеряются. Блок эррат — ПОСЛЕДНИЙ раздел отчёта: после списка только машинная строка VERDICT (самопроверку, оговорки и «где я могу ошибаться» пиши выше, в разделах 0–3, — всё после списка в план не переносится).
 9. Если ответ участника — заглушка (нет анализа и/или STANCE; упоминание ExitPlanMode или файла в `/plans/`), напиши в отчёте «ответ участника (раунд N) утрачен» и не опирайся на его пересказ.
 """
 
@@ -1276,10 +1477,22 @@ IMPL_POLICY_CHAIRMAN_BLOCK = """
 1. Тесты и ruff ревью не запускает. В `impl_report` обязателен ФАКТИЧЕСКИЙ вывод команд (хвост вывода с итоговой строкой), а не пересказ; пересказ без вывода — существенное замечание. В отчёте прямо напиши, что прогоны ревью не перегонялись.
 2. Для каждого замечания ПРЕДЫДУЩЕГО ревью проверь по коду, что исправлен КЛАСС дефекта на всём периметре задачи (аналоги найди grep'ом сам), а не только названная строка. Частичный фикс — повторный блокер: перечисли непокрытые места.
 3. Расхождение имплементации с планом, эрратой или ТЗ без записи в «отклонениях» отчёта — блокер; задокументированное отклонение, не нарушающее ТЗ и DoD, — не блокер.
+4. Категория «латентно / вне поставленной функции / потерь нет» → BACKLOG, не блокер и не существенное: замечание, которое недостижимо на целевой платформе либо проявится лишь при подключении ещё не существующей зависимости, не меняет наблюдаемый результат и не ведёт к потере данных, а также не нарушает буквальный пункт ТЗ/эрраты с наблюдаемым эффектом. Запиши такое в «Backlog (не блокирует)», вердикт оно не меняет. Нарушение буквального пункта ТЗ с НАБЛЮДАЕМЫМ эффектом остаётся блокером.
+5. Косметику не включай в «Сводку для исполнителя» (ни как «рекомендуется», ни как «дёшево»): только в backlog — каждая лишняя правка исполнителя порождает регресс и ещё один круг ревью.
+6. Не требуй от отчёта исполнителя номеров строк и не сверяй их: ссылки на код — по именам функций, методов и тестов (номера съезжают при правках, это даёт повторяющееся пустое замечание).
 """
 IMPL_POLICY_EXECUTOR_REPORT = (
     "В `impl_report` приведи ФАКТИЧЕСКИЙ вывод (хвост с итоговой строкой) каждой запущенной команды тестов "
-    "и ruff, не пересказ: ревью тесты не запускает и сверяет отчёт только статически.\n"
+    "и ruff, не пересказ: ревью тесты не запускает и сверяет отчёт только статически. Ссылайся на код по "
+    "именам функций, методов и тестов, а не по номерам строк: они съезжают при правках и не сверяются.\n"
+)
+# Н52: runaway-тесты исполнителя (62–127 МБ вывода на тест) дважды исчерпали память хоста; гигиена — правила
+# запуска, а не проверка ревью (ревью тесты не запускает)
+IMPL_POLICY_EXECUTOR_HYGIENE = (
+    "Гигиена прогонов тестов (защита хоста от runaway-вывода): запускай тесты под `timeout 300` (или другим "
+    "разумным пределом); вывод перенаправляй в файл в каталоге артефактов серии, а в отчёт и в вывод "
+    "команд приводи его хвост (≤ 40 строк), не весь лог; не помещай в сообщения assert полный вывод или "
+    "содержимое логов; временные каталоги прогонов в /tmp, созданные тестами, после прогона удаляй.\n"
 )
 IMPL_POLICY_EXECUTOR_REVISE = (
     "Для КАЖДОГО замечания определи класс дефекта и найди все его экземпляры в периметре задачи (grep); "
@@ -1381,7 +1594,63 @@ OUTPUT_LIMIT_RE = re.compile(r"output token maximum|CLAUDE_CODE_MAX_OUTPUT_TOKEN
 TRANSIENT_API_RE = re.compile(
     r"\b(?:429|500|502|503|504|529)\b|overload|rate.?limit|try again|timed out|timeout|connection",
     re.IGNORECASE)
-FAILURE_CLASSES = ("output_limit", "transient", "api_error", "stub", "format")
+# Н47: кэш завершённых раундов дуэта (в transcripts/ — оттуда его не подбирают ни git-гварды, ни коммиты)
+ROUNDS_CACHE_NAME = "_review_rounds.json"
+
+FAILURE_CLASSES = ("output_limit", "quota", "transient", "api_error", "stub", "format")
+
+# Н46/Н58: квота провайдера («API Error: 429 [1308] Usage limit reached for 5 hour. Your limit will reset at
+# 2026-11-25 21:39:28» — время в поясе провайдера, в поле UTC+8; сверено по префиксу request-id). Это НЕ
+# перегрузка: сброс — через часы, паузы 30/60/120/240 с и счётчик max_resumes сгорали впустую, а исполнителя
+# такой ответ превращал в `artifact_missing`. Класс отдельный: без пауз-повторов, остановка с временем сброса.
+QUOTA_RE = re.compile(r"\[1308\]|usage limit reached", re.IGNORECASE)
+QUOTA_RESET_RE = re.compile(
+    r"reset(?:s)?\s+at\s+(\d{4})-(\d{2})-(\d{2})[ T](\d{2}):(\d{2})(?::(\d{2}))?", re.IGNORECASE)
+
+
+def is_quota_text(text: str | None) -> bool:
+    """Ответ — «квота провайдера исчерпана» (ошибка API с кодом 1308 либо фразой Usage limit reached)."""
+    t = text or ""
+    return is_api_error_text(t) and QUOTA_RE.search(t) is not None
+
+
+def quota_cfg(cfg: dict) -> dict:
+    """Секция `quota` конфига с умолчаниями (устойчива к мусору в проектном конфиге)."""
+    q = cfg.get("quota") if isinstance(cfg.get("quota"), dict) else {}
+
+    def num(key: str, default: float) -> float:
+        try:
+            v = float(q.get(key, default))
+        except (TypeError, ValueError):
+            return default
+        return v if v == v else default             # NaN → умолчание
+
+    return {"provider_utc_offset_hours": num("provider_utc_offset_hours", 8.0),
+            "resume_margin_sec": max(0.0, num("resume_margin_sec", 90.0)),
+            "max_wait_sec": max(0.0, num("max_wait_sec", 21600.0))}
+
+
+def parse_quota_reset(text: str | None, utc_offset_hours: float = 8.0) -> float | None:
+    """Момент сброса квоты (UTC epoch) из текста ответа провайдера; None — метки нет/не разобрана.
+    Метка — местное время провайдера: `utc_offset_hours` (quota.provider_utc_offset_hours)."""
+    m = QUOTA_RESET_RE.search(text or "")
+    if not m:
+        return None
+    y, mo, d, h, mi, s = (int(g) if g is not None else 0 for g in m.groups())
+    try:
+        local = datetime(y, mo, d, h, mi, s, tzinfo=timezone(timedelta(hours=utc_offset_hours)))
+    except (ValueError, OverflowError):
+        return None
+    return local.timestamp()
+
+
+def format_reset(epoch: float | None) -> str:
+    """Время сброса для людей: UTC (как в логах провайдера) и локальное время машины."""
+    if not epoch:
+        return "время сброса неизвестно"
+    utc = datetime.fromtimestamp(epoch, UTC).strftime("%H:%M UTC")
+    loc = datetime.fromtimestamp(epoch).strftime("%H:%M %d.%m")
+    return f"{utc} (локально {loc})"
 
 LIMIT_RETRY_HINT = (
     "\n\nПредыдущая попытка не уложилась в лимит вывода модели: рассуждения заняли весь бюджет токенов, "
@@ -1407,6 +1676,8 @@ def classify_failure(text: str | None, meta: dict | None = None) -> str:
     if is_api_error_text(t):
         if OUTPUT_LIMIT_RE.search(t):
             return "output_limit"
+        if QUOTA_RE.search(t):              # до transient: 429 тут — квота на часы, а не окно перегрузки
+            return "quota"
         try:
             status = int(m.get("api_error_status") or 0)
         except (TypeError, ValueError):
@@ -1645,13 +1916,56 @@ def _errata_norm(text: str) -> str:
     return re.sub(r"[\s*_`]+", " ", text).strip().lower()
 
 
-def extract_chairman_errata(rev_text: str) -> str | None:
-    """Тело блока `## Эрраты к плану` из ревью председателя (без заголовка), дословно.
+_ERRATA_NUM_ITEM = re.compile(r"^(\d+)[.)]\s+")
+_ERRATA_ANY_HEADING = re.compile(r"^#{1,6}[ \t]+\S")
 
-    None — блока нет. Строка-заголовок ищется вне ограждённых блоков кода, берётся ПОСЛЕДНЯЯ;
-    конец — следующий заголовок того же или более высокого уровня либо конец текста; машинная
-    строка VERDICT и пометка оркестратора с хвоста отрезаются.
-    """
+
+def split_errata_afterword(body_lines: list[str]) -> tuple[list[str], list[str]]:
+    """Н44: отделить от тела блока эррат «послесловие» ревьюера (поле: после списка из 8 эррат шли
+    абзацы «**Самопроверка приёмки.**» и «**Где я могу ошибаться.**» с маркированными пунктами —
+    они попали в план, и сводка показала «14 п.», а исполнитель получил оговорки ревьюера как
+    «обязательные» эрраты). Это НЕ заголовки (гипотеза отчёта «заголовок ниже» неверна), поэтому
+    резка по заголовкам их не видит.
+
+    Правило по семантике Markdown: после первого пункта списка (маркер в колонке 0) блок
+    заканчивается на первом абзаце в колонке 0 ПОСЛЕ ПУСТОЙ СТРОКИ, который не пункт списка, не
+    заголовок и не внутри ограждённого блока кода; отступные строки и «ленивые» продолжения (без
+    пустой строки перед ними) принадлежат пункту. Нумерация, продолжающаяся ниже такого абзаца
+    (1…3, абзац, 4…), — группировка самих эррат: резки нет, чтобы не потерять настоящую эрра́ту.
+    Нет пунктов списка (эрраты прозой) — тело не трогается. Возвращает (оставленное, отрезанное)."""
+    first = next((i for i, ln in enumerate(body_lines) if _ERRATA_TOP_ITEM.match(ln)), None)
+    if first is None:
+        return list(body_lines), []
+    prev_blank, in_fence, last_num = False, False, None
+    for i in range(first, len(body_lines)):
+        ln = body_lines[i]
+        st = ln.lstrip()
+        if st.startswith("```") or st.startswith("~~~"):
+            in_fence, prev_blank = not in_fence, False
+            continue
+        if in_fence:
+            continue
+        if not ln.strip():
+            prev_blank = True
+            continue
+        m = _ERRATA_NUM_ITEM.match(ln)
+        if m:
+            last_num = int(m.group(1))
+        if ln[0] in " \t" or _ERRATA_TOP_ITEM.match(ln) or _ERRATA_ANY_HEADING.match(ln) or not prev_blank:
+            prev_blank = False
+            continue
+        if last_num is not None and any(re.match(rf"^{last_num + 1}[.)]\s", t) for t in body_lines[i:]):
+            prev_blank = False                       # нумерация продолжается ниже — это группировка эррат
+            continue
+        kept = list(body_lines[:i])
+        while kept and not kept[-1].strip():
+            kept.pop()
+        return kept, list(body_lines[i:])
+    return list(body_lines), []
+
+
+def _errata_body_and_afterword(rev_text: str) -> tuple[str | None, str]:
+    """(тело блока эррат без послесловия | None, отрезанное послесловие) — см. extract_chairman_errata."""
     lines = (rev_text or "").splitlines()
     in_fence = False
     start = level = None
@@ -1666,7 +1980,7 @@ def extract_chairman_errata(rev_text: str) -> str | None:
         if m:
             start, level = i, len(m.group(1))
     if start is None:
-        return None
+        return None, ""
     end = len(lines)
     in_fence = False
     for i in range(start + 1, len(lines)):
@@ -1684,7 +1998,19 @@ def extract_chairman_errata(rev_text: str) -> str | None:
     while body and (not body[-1].strip() or _VERDICT_LINE.fullmatch(body[-1].strip())
                     or _FALLBACK_NOTE.match(body[-1].strip())):
         body.pop()
-    return "\n".join(body).strip("\n").strip()
+    body, tail = split_errata_afterword(body)
+    return "\n".join(body).strip("\n").strip(), "\n".join(tail).strip()
+
+
+def extract_chairman_errata(rev_text: str) -> str | None:
+    """Тело блока `## Эрраты к плану` из ревью председателя (без заголовка), дословно.
+
+    None — блока нет. Строка-заголовок ищется вне ограждённых блоков кода, берётся ПОСЛЕДНЯЯ;
+    конец — следующий заголовок того же или более высокого уровня либо конец текста; машинная
+    строка VERDICT и пометка оркестратора с хвоста отрезаются; Н44: «послесловие» ревьюера после
+    списка (абзацы самопроверки/оговорок) в блок не входит (split_errata_afterword).
+    """
+    return _errata_body_and_afterword(rev_text)[0]
 
 
 def errata_count_text(info: dict) -> str:
@@ -1718,7 +2044,7 @@ def apply_accept_errata(rev_path: Path, plan_path: Path) -> tuple[str, dict]:
     при отсутствии блока, не прошла проверка после записи (план восстанавливается).
     """
     rev_text = Path(rev_path).read_text(encoding="utf-8")
-    body = extract_chairman_errata(rev_text)
+    body, afterword = _errata_body_and_afterword(rev_text)
     if body is None:
         if re.search(r"\(\s*ЭРРАТ[АЫ]\b", rev_text):
             raise ErrataError(f"в {Path(rev_path).name} замечания помечены «ЭРРАТА», но блока "
@@ -1756,7 +2082,10 @@ def apply_accept_errata(rev_path: Path, plan_path: Path) -> tuple[str, dict]:
         Path(plan_path).write_text(plan_text, encoding="utf-8")        # откат
         raise ErrataError(f"проверка после записи не прошла (эрраты {rev_name} не найдены в плане) — план восстановлен")
     top = sum(1 for ln in body.splitlines() if _ERRATA_TOP_ITEM.match(ln))
-    return "applied", {"items": len(sigs), "top_items": top, "sha": sha}
+    info = {"items": len(sigs), "top_items": top, "sha": sha}
+    if afterword:
+        info["afterword_lines"] = len([ln for ln in afterword.splitlines() if ln.strip()])
+    return "applied", info
 
 
 def errata_block_reviewer(plan_rel: str, errata: str) -> str:
@@ -2096,6 +2425,12 @@ class DuoReviewer:
         if not self._is_stub_response(text) and meta.get("stop_reason") != "max_tokens":
             return text, cost, prompt
         kind = classify_failure(text, meta)
+        if kind == "quota":
+            # Н46: ретрай бессмыслен (сброс через часы) — остановка серии; цена попытки — в бюджет
+            self._save_tr(f"{tag}_attempt1", prompt, text, cost, note=self._attempt_note(kind, meta))
+            log(self.task_dir, f"ВНИМАНИЕ: ответ {tag} — квота провайдера исчерпана, повторов не будет")
+            self._acc(cost)
+            raise quota_error(self.cfg, tag, text, cost=cost)
         log(self.task_dir, f"ВНИМАНИЕ: ответ {tag} — заглушка/сбой (класс: {kind}; ExitPlanMode/пусто/API Error) "
                            f"— ретрай с уточнением")
         self._bump("stub_retries")
@@ -2112,6 +2447,10 @@ class DuoReviewer:
             lambda: self.t.call(retry_prompt, mode="plan", timeout=timeout, cwd=self.repo,
                                 role="reviewer", persona=persona, **extra), tag)
         self._take_meta()
+        if is_quota_text(text2):                       # квота пришла уже на повторе
+            self._save_tr(f"{tag}_attempt2", retry_prompt, text2, cost2, note="класс=quota")
+            self._acc(cost + cost2)
+            raise quota_error(self.cfg, tag, text2, cost=cost + cost2)
         return text2, cost + cost2, retry_prompt
 
     @staticmethod
@@ -2132,6 +2471,8 @@ class DuoReviewer:
         while True:
             try:
                 return fn()
+            except EnvironmentProblem:
+                raise                                        # Н50: повторы бессмысленны — окружение не починится паузой
             except RuntimeError as e:
                 if attempt >= retries:
                     raise
@@ -2172,6 +2513,8 @@ class DuoReviewer:
             report, _, cost = self.t.call(prompt, mode="plan", timeout=timeout, cwd=self.repo,
                                           role=role, persona=persona, **extra)
             return report, cost
+        except EnvironmentProblem:
+            raise
         except RuntimeError:
             log(self.task_dir, "председатель: сбой/таймаут — ретрай с удвоенным таймаутом")
             report, _, cost = self._transport_retry(
@@ -2247,6 +2590,11 @@ class DuoReviewer:
                                f"рассуждений {meta.get('thinking_chars', '?')} знаков "
                                f"(пик ≈{meta.get('thinking_tokens_peak', '?')} ток.), "
                                f"сообщений {meta.get('messages', '?')}")
+            if kind == "quota":
+                # Н46/Н58: сброс квоты — через часы; паузы 30–240 с и повторы бессмысленны. Цена попытки
+                # (бывает уже оплачено рассуждение до 429) — в бюджет; остановка с временем сброса.
+                self._acc(total_cost)
+                raise quota_error(self.cfg, who, report, cost=total_cost)
             if kind == "transient":
                 trans_n += 1
                 if trans_n > max_trans:
@@ -2772,6 +3120,8 @@ VERDICT: REVISE"""
         except Exception as e:
             try:
                 e.review_cost = round(float(getattr(self, "call_cost", 0.0) or 0.0), 4)
+                with self.__dict__.setdefault("_ev_lock", threading.Lock()):   # Н49: ретраи — в `status`
+                    e.review_events = dict(self.__dict__.get("_ev") or {})
             except Exception:
                 pass
             raise
@@ -2817,8 +3167,6 @@ VERDICT: REVISE"""
 
         self._check_artifact_exists(artifact_rel, phase)
 
-        log(self.task_dir, f"дуо R1 (вслепую, параллельно): {A['name']} vs {B['name']} — {artifact_rel}")
-
         # pipev3 P1: контекст-пак (один на оба плеча — строится до потоков)
         ctx_cfg = self.cfg.get("review") if isinstance(self.cfg.get("review"), dict) else {}
         pack, overflow = self._build_pack(phase, artifact_rel, artifacts_rel, base_head)
@@ -2828,32 +3176,58 @@ VERDICT: REVISE"""
         # (без эррат промпты байт-в-байт прежние)
         errata = read_plan_errata(self.repo, plan_rel) if phase == "impl" else ""
         errata_r1 = errata_block_reviewer(plan_rel, errata)
-        before = guard.snapshot_before_review(artifacts_rel)
-        with ThreadPoolExecutor(max_workers=2) as ex:
-            fa = ex.submit(self._round1, A, artifact_rel, phase, task_text, rejected, pack, errata_r1)
-            fb = ex.submit(self._round1, B, artifact_rel, phase, task_text, rejected, pack, errata_r1)
-            r1a, r1b = fa.result(), fb.result()
-        guard.enforce_readonly(before, artifacts_rel, self.task_dir)
+        # Н47: завершённые раунды прерванного ревью (остановка по квоте/транспорту посреди R2/R3/синтеза)
+        # переживают `--resume`, если вход тот же; раньше R1 пересчитывался заново (поле: $5,99 впустую)
+        key = self._rounds_key(phase, artifact_rel, task_text, A, B, rounds, rejected, errata, pack)
+        have = self._rounds_load(key, rounds)
+        restored: list[str] = []
+
+        if "r1" in have:
+            r1a, r1b = have["r1"]
+            restored.append("r1")
+            log(self.task_dir, f"дуо R1: взяты из прерванного ревью (вход тот же) — {A['name']} vs {B['name']}, "
+                               f"повторная оплата не нужна")
+        else:
+            log(self.task_dir, f"дуо R1 (вслепую, параллельно): {A['name']} vs {B['name']} — {artifact_rel}")
+            before = guard.snapshot_before_review(artifacts_rel)
+            with ThreadPoolExecutor(max_workers=2) as ex:
+                fa = ex.submit(self._round1, A, artifact_rel, phase, task_text, rejected, pack, errata_r1)
+                fb = ex.submit(self._round1, B, artifact_rel, phase, task_text, rejected, pack, errata_r1)
+                r1a, r1b = fa.result(), fb.result()
+            guard.enforce_readonly(before, artifacts_rel, self.task_dir)
+            self._rounds_save(key, "r1", r1a, r1b)          # после enforce_readonly: файл не «правка ревьюера»
         ma = parse_read_manifest(r1a) if pack is not None else None
         mb = parse_read_manifest(r1b) if pack is not None else None
 
-        log(self.task_dir, "дуо R2 (перекрёстный допрос, параллельно)")
-        before = guard.snapshot_before_review(artifacts_rel)
-        with ThreadPoolExecutor(max_workers=2) as ex:
-            fa = ex.submit(self._round2, A, r1a, B["name"], r1b, mb)
-            fb = ex.submit(self._round2, B, r1b, A["name"], r1a, ma)
-            r2a, r2b = fa.result(), fb.result()
-        guard.enforce_readonly(before, artifacts_rel, self.task_dir)
+        if "r2" in have:
+            r2a, r2b = have["r2"]
+            restored.append("r2")
+            log(self.task_dir, "дуо R2: взяты из прерванного ревью (вход тот же), повторная оплата не нужна")
+        else:
+            log(self.task_dir, "дуо R2 (перекрёстный допрос, параллельно)")
+            before = guard.snapshot_before_review(artifacts_rel)
+            with ThreadPoolExecutor(max_workers=2) as ex:
+                fa = ex.submit(self._round2, A, r1a, B["name"], r1b, mb)
+                fb = ex.submit(self._round2, B, r1b, A["name"], r1a, ma)
+                r2a, r2b = fa.result(), fb.result()
+            guard.enforce_readonly(before, artifacts_rel, self.task_dir)
+            self._rounds_save(key, "r2", r2a, r2b)
 
         r3a = r3b = ""
         if rounds >= 3:
-            log(self.task_dir, "дуо R3 (финальные позиции)")
-            before = guard.snapshot_before_review(artifacts_rel)
-            with ThreadPoolExecutor(max_workers=2) as ex:
-                fa = ex.submit(self._round3, A, r2a)
-                fb = ex.submit(self._round3, B, r2b)
-                r3a, r3b = fa.result(), fb.result()
-            guard.enforce_readonly(before, artifacts_rel, self.task_dir)
+            if "r3" in have:
+                r3a, r3b = have["r3"]
+                restored.append("r3")
+                log(self.task_dir, "дуо R3: взяты из прерванного ревью (вход тот же), повторная оплата не нужна")
+            else:
+                log(self.task_dir, "дуо R3 (финальные позиции)")
+                before = guard.snapshot_before_review(artifacts_rel)
+                with ThreadPoolExecutor(max_workers=2) as ex:
+                    fa = ex.submit(self._round3, A, r2a)
+                    fb = ex.submit(self._round3, B, r2b)
+                    r3a, r3b = fa.result(), fb.result()
+                guard.enforce_readonly(before, artifacts_rel, self.task_dir)
+                self._rounds_save(key, "r3", r3a, r3b)
 
         sa, sb = self.parse_stance(r3a or r2a), self.parse_stance(r3b or r2b)
         log(self.task_dir, f"STANCE: {A['name']}={sa}, {B['name']}={sb}; синтез председателя")
@@ -2882,8 +3256,82 @@ VERDICT: REVISE"""
             "cost_usd": round(self.call_cost, 4),   # P0: per-call, не кумулятив
             **self._ev,                             # stub_retries / transport_retries
         }
+        if restored:
+            telemetry["rounds_restored"] = restored        # Н47: раунды из прерванного ревью (оплачены тогда же)
         rev_file.write_text(report, encoding="utf-8")
+        self._rounds_clear()                               # ревью дошло до конца — кэш раундов больше не нужен
         return verdict, self.call_cost, telemetry
+
+    # --- Н47: кэш завершённых раундов дуэта (переживает остановку и `--resume`) ---
+
+    def _rounds_cache_path(self) -> Path:
+        return self.transcripts / ROUNDS_CACHE_NAME
+
+    def _rounds_key(self, phase: str, artifact_rel: str, task_text: str, A: dict, B: dict, rounds: int,
+                    rejected: str, errata: str, pack: str | None) -> str:
+        """Ключ входа ревью: всё, от чего зависят ответы раундов. Изменился любой элемент — в том числе
+        СОДЕРЖИМОЕ файлов артефакта (исполнитель переделал отчёт/дифф) — кэш не подходит и игнорируется."""
+        import hashlib
+        h = hashlib.sha256()
+
+        def add(x) -> None:
+            h.update(str(x).encode("utf-8", "replace"))
+            h.update(b"\x00")
+
+        for x in (phase, artifact_rel, task_text, rounds, rejected, errata, pack or ""):
+            add(x)
+        for m in (A, B):
+            add(json.dumps(m, sort_keys=True, ensure_ascii=False, default=str))
+        for tok in artifact_rel.split():
+            f = self.repo / tok.strip("`")
+            try:
+                add(f.read_bytes() if f.is_file() else "<нет файла>")
+            except OSError:
+                add("<не читается>")
+        return h.hexdigest()
+
+    def _rounds_load(self, key: str, rounds: int) -> dict[str, tuple[str, str]]:
+        """Раунды прерванного ревью с тем же ключом входа. Берутся только непрерывным началом (R1; R1+R2;
+        R1+R2+R3) и только содержательные ответы: заглушка/пустышка раунда не кэшируется и пересчитывается."""
+        try:
+            data = load_json(self._rounds_cache_path())
+        except (OSError, ValueError):
+            self._rounds_mem = {"v": 1, "key": key}
+            return {}
+        if not isinstance(data, dict) or data.get("v") != 1 or data.get("key") != key:
+            self._rounds_mem = {"v": 1, "key": key}                  # чужой вход: перезапишем с первого же раунда
+            return {}
+        out: dict[str, tuple[str, str]] = {}
+        for name in ("r1", "r2", "r3")[: 3 if rounds >= 3 else 2]:
+            v = data.get(name)
+            if not (isinstance(v, list) and len(v) == 2 and all(isinstance(x, str) and x.strip() for x in v)):
+                break
+            out[name] = (v[0], v[1])
+        self._rounds_mem = {"v": 1, "key": key, **{k: list(t) for k, t in out.items()}}
+        return out
+
+    def _rounds_save(self, key: str, name: str, a: str, b: str) -> None:
+        """Записать завершённый раунд. Заглушки (пусто/ExitPlanMode/API Error) не кэшируются — на
+        resume такой раунд честно пересчитается. Сбой записи кэша не должен ронять ревью."""
+        if self._is_stub_response(a) or self._is_stub_response(b):
+            return
+        mem = self.__dict__.get("_rounds_mem")
+        if not isinstance(mem, dict) or mem.get("key") != key:
+            mem = {"v": 1, "key": key}
+        mem[name] = [a, b]
+        self._rounds_mem = mem
+        try:
+            self.transcripts.mkdir(parents=True, exist_ok=True)
+            save_json(self._rounds_cache_path(), mem)
+        except OSError as e:
+            log(self.task_dir, f"ВНИМАНИЕ: кэш раундов дуэта не записан ({e}) — resume пересчитает раунд")
+
+    def _rounds_clear(self) -> None:
+        self._rounds_mem = {}
+        try:
+            self._rounds_cache_path().unlink(missing_ok=True)
+        except OSError:
+            pass
 
     # --- общие шаги review() дуэта и review() единственного проверяющего ---
 
@@ -3039,6 +3487,8 @@ class Executor:
         try:
             return self.t.call(prompt, mode="full", resume_session=sid, timeout=timeout, cwd=self.repo,
                                role="executor", model=self.state.get("executor_model") or "")
+        except EnvironmentProblem:
+            raise                                            # Н50: окружение, а не «resume не удался»
         except RuntimeError as e:
             if sid and "resume" in str(e).lower():
                 log(self.task_dir, f"resume сессии не удался ({e}); пробую новую сессию")
@@ -3092,6 +3542,11 @@ class Executor:
             if err is None and not is_api_error_text(text):
                 break
             failure = str(err) if err is not None else text.strip()
+            if err is None and is_quota_text(text):
+                # Н46/Н58: квота на часы — повторы (30/60/120 с) и «дожимающие» ходы бесполезны, а прежний путь
+                # превращал 429 в `artifact_missing`. Серия встаёт как `transport` со временем сброса.
+                self._finalize(prompt, tag, text, cost, new_sid, sid, failed)
+                raise quota_error(self.cfg, "исполнитель", text)
             if attempt >= retries:
                 if err is not None:
                     self._finalize(prompt, tag, f"[сбой исполнителя: {failure}]", cost, new_sid, sid, failed)
@@ -3224,7 +3679,7 @@ class Executor:
 
     def implement(self, task_text: str, plan_rel: str, version: int, resumed: bool = False) -> str:
         errata_block = errata_block_executor(plan_rel, read_plan_errata(self.repo, plan_rel))
-        impl_block = IMPL_POLICY_EXECUTOR_REPORT if impl_strict_enabled(self.cfg) else ""
+        impl_block = (IMPL_POLICY_EXECUTOR_REPORT + IMPL_POLICY_EXECUTOR_HYGIENE) if impl_strict_enabled(self.cfg) else ""
         task_view = task_for_prompt(task_text, path_hint=f"{self.state['artifacts_rel']}/task.md")
         prompt = (EXECUTOR_RESUMED_PREFACE if resumed else "") + self._common() + f"""
 ЗАДАЧА (для контекста):
@@ -3247,7 +3702,8 @@ class Executor:
                     resumed: bool = False) -> str:
         rev = rev_file.read_text(encoding="utf-8")
         errata_block = errata_block_executor(plan_rel, read_plan_errata(self.repo, plan_rel), revise=True)
-        impl_block = (IMPL_POLICY_EXECUTOR_REVISE + IMPL_POLICY_EXECUTOR_REPORT) if impl_strict_enabled(self.cfg) else ""
+        impl_block = ((IMPL_POLICY_EXECUTOR_REVISE + IMPL_POLICY_EXECUTOR_REPORT + IMPL_POLICY_EXECUTOR_HYGIENE)
+                      if impl_strict_enabled(self.cfg) else "")
         prompt = (EXECUTOR_RESUMED_PREFACE if resumed else "") + self._common() + f"""
 Отчёт ревью надсмотрщика по твоей имплементации (учти КАЖДОЕ замечание из «Сводки для исполнителя»):
 
@@ -3396,12 +3852,41 @@ def _glob_prefix(p: str) -> str:
     return p[:min(idx)] if idx else p
 
 
+def _flat_glob_dir(p: str) -> str | None:
+    """Н53: каталог «плоского» glob'а — `dir/*.cs` (маска имени только в ПОСЛЕДНЕМ сегменте, и это не голая
+    `*`/`**`): декларация «файлы этого каталога». Голая `*` на хвосте (`dir/*`, так нормализуется `dir/`) —
+    поддерево, не плоский глоб. None — путь не плоский глоб. Корень репо — пустая строка."""
+    d, _, last = p.rpartition("/")
+    if not any(c in last for c in _GLOB_CHARS) or last in ("*", "**") or any(c in d for c in _GLOB_CHARS):
+        return None
+    return d
+
+
+def _flat_vs_deeper(p: str, q: str) -> bool:
+    """Н53: `p` — плоский глоб каталога D, а `q` — глоб, чей литеральный путь уходит ГЛУБЖЕ D (в подкаталог):
+    корень каталога против подкаталога — разные декларации (`src/Cli/*.cs` ⇄ `src/Cli/Burst/*`)."""
+    d = _flat_glob_dir(p)
+    if d is None:
+        return False
+    base = d + "/" if d else ""
+    gq = _glob_prefix(q)
+    return gq.startswith(base) and "/" in gq[len(base):]
+
+
 def patterns_overlap(p: str, q: str) -> bool:
     """Могут ли два пути/glob'а описывать один файл. Консервативно: глоб против глоба —
     по общему литеральному префиксу (`api/*.py` и `api/*.js` считаются пересекающимися,
-    ложное срабатывание лечится `--ignore-claims`/`parallel.shared_ok`)."""
+    ложное срабатывание лечится `--ignore-claims`/`parallel.shared_ok`).
+
+    Н53: исключение — «плоский» глоб против глоба из ПОДкаталога (`dir/*.cs` ⇄ `dir/sub/*`): `fnmatch`
+    пересекает `/`, и корень каталога блокировал подкаталог при том, что файлы не пересекались. Это касается
+    только пары ДЕКЛАРАЦИЙ (глоб против глоба); конкретные файлы (фактически изменённые, `actual`) сверяются
+    как прежде и ловят настоящее пересечение."""
     if p == q:
         return True
+    p_glob, q_glob = any(c in p for c in _GLOB_CHARS), any(c in q for c in _GLOB_CHARS)
+    if p_glob and q_glob and (_flat_vs_deeper(p, q) or _flat_vs_deeper(q, p)):
+        return False
     if fnmatch.fnmatch(p, q) or fnmatch.fnmatch(q, p):
         return True
     if q.startswith(p.rstrip("/") + "/") or p.startswith(q.rstrip("/") + "/"):
@@ -3821,6 +4306,64 @@ class Pipeline:
             st["spent_usd"] = round(float(st.get("spent_usd", 0.0) or 0.0) + c, 4)
             log(self.task_dir, f"БЮДЖЕТ: ревью оборвалось ({type(err).__name__}), в spent_usd учтено ${c:.2f} "
                                f"уже потраченного")
+        # Н49: ревью, оборванное исключением, не доходит до review_telemetry — его ретраи (паузы на 529,
+        # повторы заглушек) исчезали из `status` (поле: нули при 13 и 5 отвергнутых ответах). Копим отдельно,
+        # в `st.review_aborted`: переживает `resume`, суммируется в `review_transport`.
+        ev = getattr(err, "review_events", None)
+        if isinstance(ev, dict):
+            ab = st.setdefault("review_aborted", {"count": 0, "cost_usd": 0.0, **REVIEW_EV_ZERO})
+            ab["count"] = int(ab.get("count", 0) or 0) + 1
+            ab["cost_usd"] = round(float(ab.get("cost_usd", 0.0) or 0.0) + max(c, 0.0), 4)
+            for k in REVIEW_EV_ZERO:
+                ab[k] = int(ab.get(k, 0) or 0) + int(ev.get(k, 0) or 0)
+
+    def _preflight_env(self) -> None:
+        """Н50: до любых изменений серии убедиться, что `claude` (и интерпретатор его shebang) запустится в
+        ЭТОМ окружении. Отказ — `sys.exit` без правок state.json: серия остаётся как была (а не получает
+        ложный `crash`), причина — в консоли/`orchestrator_bg.log`. Только для настоящего транспорта
+        (подмена в тестах/хуках проверку не проходит — вызывать нечего)."""
+        if not isinstance(self.t, ClaudeGlm):
+            return
+        problem = claude_env_problem(self.cfg)
+        if problem:
+            log(self.task_dir, f"ОКРУЖЕНИЕ: {problem}")
+            sys.exit(f"ОТКАЗ: окружение не позволяет вызвать модель: {problem}")
+
+    def _quota_reason(self, e: QuotaExhaustedError) -> str:
+        """Текст остановки по квоте провайдера: что случилось, когда сброс, как продолжить."""
+        return (f"{e}. Сброс квоты: {format_reset(e.reset_at)}. Повторы до сброса бессмысленны — продолжить после "
+                f"него: `run --task {self.task} --resume --wait-quota` (сам дождётся сброса) либо надзор с "
+                f"supervisor.auto_resume=true (возобновит после сброса, не расходуя max_resumes)")
+
+    def _wait_quota_reset(self) -> None:
+        """`run --resume --wait-quota` после остановки по квоте (Н46/Н58): дождаться сброса и продолжить.
+        Держит `.lock` (серия видна как живая), сон — кусками ≤ 60 с. Нет метки сброса / остановка не по квоте
+        — ничего не ждём (первый же вызов модели покажет, вернулась ли квота). Дольше quota.max_wait_sec
+        (по умолчанию 6 ч — 5-часовое окно + запас) — отказ: это уже не «окно», решает человек."""
+        st = self.load_state()
+        h = st.get("halt") if isinstance(st.get("halt"), dict) else {}
+        if h.get("cause") != "quota":
+            log(self.task_dir, "КВОТА: --wait-quota задан, но остановка не по квоте провайдера — ждать нечего")
+            return
+        reset = h.get("reset_at")
+        if not reset:
+            log(self.task_dir, "КВОТА: в ответе провайдера не было времени сброса — ждать по метке нечего, "
+                               "возобновляю сразу (если квота ещё не вернулась, серия встанет снова)")
+            return
+        q = quota_cfg(self.cfg)
+        target = float(reset) + q["resume_margin_sec"]
+        remain = target - time.time()
+        if remain <= 0:
+            return
+        if remain > q["max_wait_sec"]:
+            sys.exit(f"ОТКАЗ: до сброса квоты {remain / 3600:.1f} ч (сброс: {format_reset(float(reset))}), это больше "
+                     f"quota.max_wait_sec={q['max_wait_sec']:.0f} с — ждать автоматически не буду. Решение за человеком.")
+        log(self.task_dir, f"КВОТА: жду сброса до {format_reset(target)} (≈ {remain / 60:.0f} мин) — затем продолжу "
+                           f"остановленный шаг; серия считается живой (держу .lock)")
+        while remain > 0:
+            time.sleep(min(60.0, remain))
+            remain = target - time.time()
+        log(self.task_dir, "КВОТА: срок сброса наступил — возобновляю")
 
     def _halt_empty_review(self, st: dict, phase: str, err: Exception) -> None:
         """Guard пустого ревью (29.10.2026): проверяющий вернул ACCEPT, не обратившись к инструментам,
@@ -4217,6 +4760,33 @@ class Pipeline:
         log(self.task_dir, f"БАЗА: worktree подтянут к HEAD основного дерева: +{cnt.strip() or '?'} коммит(ов) "
                            f"({head[:10]} → {main[:10]}); план составлен на прежней базе")
 
+    def _snapshot_kb(self) -> int:
+        """review.snapshot_max_file_kb: новые файлы крупнее не входят в дифф ревью (данные, дампы)."""
+        rv = self.cfg.get("review") if isinstance(self.cfg.get("review"), dict) else {}
+        try:
+            return int(rv.get("snapshot_max_file_kb", 512))
+        except (TypeError, ValueError):
+            return 512
+
+    def _record_snapshot(self, st: dict, v: int, tree: str, arts_rel: str) -> str:
+        """Н45: запомнить снимок дерева версии v (`st.impl_trees`) и, если есть снимок v−1, записать
+        `diff_delta_v{v}.patch` — что исполнитель изменил после предыдущего ревью. Возвращает фразу для
+        промпта ревью ('' — дельты нет: первая версия, снимок не удался или объект убран gc). Полный дифф
+        и полный проход по DoD дельта НЕ заменяет — она помогает проверить закрытие замечаний и регресс."""
+        if not tree:
+            return ""
+        trees = st.setdefault("impl_trees", {})
+        trees[str(v)] = tree
+        prev = trees.get(str(v - 1))
+        if not prev or prev == tree:
+            return ""
+        delta = self.task_dir / f"diff_delta_v{v}.patch"
+        if not self.guard.diff_delta(prev, tree, delta):
+            return ""
+        return (f" Дельта итерации (изменения исполнителя после прошлого ревью, v{v - 1}→v{v}): "
+                f"{arts_rel}/diff_delta_v{v}.patch — начни с неё: закрыты ли прошлые замечания и нет ли "
+                f"регресса от правок; полный проход по DoD и эрратам она не отменяет.")
+
     def _zone_outside(self, st: dict, arts_rel: str) -> list[str]:
         """Изменённые в worktree файлы вне заявленной зоны записи (пусто: зона не заявлена/shared)."""
         claim = st.get("claim")
@@ -4233,7 +4803,7 @@ class Pipeline:
     # ---------- pipework3: чистые остановки, шаги исполнителя, возобновление ----------
 
     def halt(self, st: dict, kind: str, reason: str, *, phase: str | None = None,
-             resumable: bool = True) -> None:
+             resumable: bool = True, cause: str | None = None, reset_at: float | None = None) -> None:
         """Единая точка остановки серии (pipework3).
 
         Любая остановка — запись в state (phase=needs_human, stop_reason, halt{kind,phase,
@@ -4261,10 +4831,19 @@ class Pipeline:
                             "at": datetime.now().isoformat(timespec="seconds")}
         if cur not in ("plan", "impl"):
             resumable = False                # solo и прочее: возобновления с места нет — решает человек
+        st.pop("inflight_review", None)          # Н55: остановка чистая — цена оборванного ревью учтена отдельно
         st["phase"] = "needs_human"
         st["stop_reason"] = reason
         st["halt"] = {"kind": kind, "phase": cur, "resumable": bool(resumable), "notified": False,
                       "at": datetime.now().isoformat(timespec="seconds")}
+        if cause:
+            # Н46: причина внутри kind (transport/cause=quota): надзор и `wait` различают «квота до HH:MM»
+            # и «сбой сети»; reset_at — UTC epoch сброса квоты (может отсутствовать)
+            st["halt"]["cause"] = cause
+            if reset_at:
+                st["halt"]["reset_at"] = round(float(reset_at), 1)
+            if cause == "quota":
+                st["quota_halts"] = int(st.get("quota_halts", 0) or 0) + 1
         self.save_state(st)
         log(self.task_dir, f"СТОП: {reason}")
         # `notified` — факт ПРИНЯТОГО демоном уведомления, а не «ключ включён»: надзор пропускает своё
@@ -4275,6 +4854,17 @@ class Pipeline:
             self.save_state(st)
 
     def _notify(self, title: str, body: str) -> bool:
+        """Уведомление об остановке: десктоп (`notify.desktop`) и/или внешняя команда (`notify.command`, Н54).
+        True — если хотя бы один канал ПРИНЯЛ сообщение (надзор тогда своё не дублирует); исход каждого
+        канала пишется в orchestrator.log."""
+        ok = self._notify_desktop(title, body)
+        res = run_notify_command(self.cfg, title, body)
+        if res:
+            log(self.task_dir, f"УВЕДОМЛЕНИЕ (команда): {res}")
+            ok = ok or res.startswith("доставлено")
+        return ok
+
+    def _notify_desktop(self, title: str, body: str) -> bool:
         """Десктоп-уведомление (notify.desktop; в тестах выключено). True — только если notify-send
         принял его (rc=0); причина неудачи пишется в orchestrator.log, а не глотается молча."""
         if not (self.cfg.get("notify") or {}).get("desktop"):
@@ -4310,8 +4900,21 @@ class Pipeline:
 
     def _recover_inflight(self, st: dict) -> None:
         """Процесс умер посреди revise-шага без halt (kill -9, перезагрузка, OOM): восстановить
-        маркер rework из inflight — иначе рестарт отревьюил бы прежнюю версию артефакта."""
+        маркер rework из inflight — иначе рестарт отревьюил бы прежнюю версию артефакта.
+
+        Н55: если процесс именно УМЕР (фаза не needs_human и нет halt — kill -9/OOM/перезагрузка), вызов модели в
+        полёте (шаг исполнителя либо ревью) оплачен, но его цена в `spent_usd` не попала: фиксируем его в
+        `unrecorded_calls` (число и оценка минут работы модели — `status`). Чистая остановка (halt) цену
+        учитывает сама (`_finalize`/`_charge_review`) — её не считаем."""
         inf = st.get("inflight")
+        if st.get("phase") != "needs_human" and not st.get("halt"):
+            if isinstance(inf, dict):
+                self._note_unrecorded(st, "executor", str(inf.get("step")), inf.get("at"))
+            ir = st.pop("inflight_review", None)
+            if isinstance(ir, dict):
+                self._note_unrecorded(st, "review", str(ir.get("rev")), ir.get("at"))
+        else:
+            st.pop("inflight_review", None)
         if not isinstance(inf, dict):
             return
         if inf.get("step") in ("revise_plan", "revise_impl") and inf.get("rev") and not st.get("rework"):
@@ -4320,6 +4923,34 @@ class Pipeline:
                             "at": datetime.now().isoformat(timespec="seconds")}
             log(self.task_dir, f"ВОССТАНОВЛЕНИЕ: прерванный шаг {inf['step']} v{inf.get('version')} — "
                                f"доработка по {inf['rev']} будет доведена первым шагом")
+
+    def _mark_review(self, st: dict, phase: str, rev_file: Path) -> None:
+        """Н55: отметка «ревью в полёте» (сохраняется сразу): смерть процесса посреди ревью не оставляет иных
+        следов, а оплаченные вызовы дуэта не попадают в spent_usd — по метке они хотя бы считаются."""
+        st["inflight_review"] = {"phase": phase, "rev": rev_file.name,
+                                 "at": datetime.now().isoformat(timespec="seconds")}
+        self.save_state(st)
+
+    def _note_unrecorded(self, st: dict, kind: str, label: str, started: str | None) -> None:
+        """Н55: записать оборванный вызов модели, цена которого не учтена. Минуты — от метки старта до последней
+        активности консоли оркестратора (mtime orchestrator_bg.log: пульс печатается каждые
+        TRANSPORT_HEARTBEAT_SEC); оценка снизу, а не измерение."""
+        minutes = None
+        try:
+            t0 = datetime.fromisoformat(str(started)).timestamp()
+            t1 = (self.task_dir / "orchestrator_bg.log").stat().st_mtime
+            if t1 > t0:
+                minutes = round((t1 - t0) / 60, 1)
+        except (TypeError, ValueError, OSError):
+            pass
+        lst = st.setdefault("unrecorded_calls", [])
+        lst.append({"kind": kind, "step": label, "started": started, "minutes": minutes,
+                    "found": datetime.now().isoformat(timespec="seconds")})
+        del lst[:-20]
+        st["unrecorded_count"] = int(st.get("unrecorded_count", 0) or 0) + 1
+        log(self.task_dir, f"УЧЁТ: процесс умер посреди вызова модели ({kind}: {label}"
+                           f"{f', ≈{minutes} мин работы' if minutes else ''}) — вызов оплачен, но его цена в "
+                           f"spent_usd НЕ входит (нижняя граница расхождения; см. status → unrecorded)")
 
     def _try_resume_halt(self, st: dict) -> bool:
         """`run --resume` (и --continue) из needs_human с машинной записью halt: возобновить с места остановки.
@@ -4387,8 +5018,10 @@ class Pipeline:
         if status == "applied":
             st["errata_applied"] = {"rev": last["rev"], "plan": plan_path.name, **info,
                                     "at": datetime.now().isoformat(timespec="seconds")}
+            cut = (f"; послесловие ревьюера ({info['afterword_lines']} стр.) в план не перенесено — "
+                   f"оно осталось в {last['rev']}" if info.get("afterword_lines") else "")
             log(self.task_dir, f"ЭРРАТЫ: блок {last['rev']} дописан в {arts_rel}/{plan_path.name} "
-                               f"({errata_count_text(info)}, sha256:{info['sha']})")
+                               f"({errata_count_text(info)}, sha256:{info['sha']}){cut}")
         elif status == "present":
             log(self.task_dir, f"ЭРРАТЫ: блок {last['rev']} уже в {plan_path.name} — без изменений")
         else:
@@ -4411,7 +5044,7 @@ class Pipeline:
                       f"исчерпан лимит итераций {what} ({lim}): ревью {rev_file.name} (REVISE) завершено, "
                       f"доработка по нему НЕ начата. Подними limits.{key} (или `run --task {self.task} "
                       f"--resume --add-iterations N`) — продолжение начнётся с доработки по {rev_file.name}. "
-                      f"Артефакты: `{arts_rel}/`", phase=phase)
+                      f"Артефакты: `{arts_rel}/`.{convergence_summary(self.task_dir, st, phase)}", phase=phase)
             return True
         try:
             self.check_budget(st)
@@ -4425,7 +5058,7 @@ class Pipeline:
 
     def run(self, phases: str = "auto", force_continue: bool = False, add_budget: float = 0.0,
             add_iterations: int = 0, resume: bool = False, allow_shared_parallel: bool = False,
-            ignore_claims: bool = False, wait_resources: float = 0.0) -> None:
+            ignore_claims: bool = False, wait_resources: float = 0.0, wait_quota: bool = False) -> None:
         """Цикл серии. pipework3: любая необработанная ошибка превращается в чистую остановку
         (halt: state + лог), а не в молчаливую смерть процесса с phase=plan|impl.
 
@@ -4439,6 +5072,9 @@ class Pipeline:
         self.acquire_lock()
         self._live_state: dict | None = None
         try:
+            self._preflight_env()
+            if wait_quota and resume:
+                self._wait_quota_reset()        # до захвата ресурсов: многочасовое ожидание их не держит
             self._take_resources(wait_resources)
             self._run_impl(phases, force_continue, add_budget, add_iterations, resume,
                            allow_shared_parallel, ignore_claims)
@@ -4454,6 +5090,17 @@ class Pipeline:
             st = self._live_state or self.load_state()
             self.halt(st, "budget", f"{e}. Подними limits.budget_usd либо "
                       f"`run --task {self.task} --resume --add-budget USD`")
+        except QuotaExhaustedError as e:
+            st = self._live_state or self.load_state()
+            self._charge_review(st, e)
+            self.halt(st, "transport", self._quota_reason(e), cause="quota", reset_at=e.reset_at)
+        except EnvironmentProblem as e:
+            # Н50: окружение службы (PATH без claude/node) — не `crash` и не `transport`: надзор такие остановки
+            # не возобновляет (повтор упадёт так же и сожжёт max_resumes), человек чинит PATH/claude_bin
+            st = self._live_state or self.load_state()
+            self._charge_review(st, e)
+            self.halt(st, "env", f"окружение не позволяет вызвать модель: {e}. Исправь и продолжи: "
+                      f"`run --task {self.task} --resume`", cause="env")
         except RuntimeError as e:
             st = self._live_state or self.load_state()
             self._charge_review(st, e)        # Н42: цена оборванного ревью — в spent_usd
@@ -4648,6 +5295,7 @@ class Pipeline:
                 self.check_budget(st, soft=True)
                 n = self.next_rev_number(st, "plan")
                 rev_file = self.task_dir / f"rev{n:03d}_plan.md"
+                self._mark_review(st, "plan", rev_file)
                 log(self.task_dir, f"PLAN ревью #{it} (rev{n:03d}) плана v{cur_v}")
                 try:
                     verdict, cost, telemetry = reviewer.review(
@@ -4663,6 +5311,7 @@ class Pipeline:
                 except EmptyReviewError as e:
                     self._halt_empty_review(st, "plan", e)
                     return
+                st.pop("inflight_review", None)                          # Н55: ревью завершено и учтено
                 st["plan_iteration"] = it
                 st["spent_usd"] = round(st.get("spent_usd", 0.0) + cost, 4)
                 st.setdefault("review_telemetry", []).append(telemetry)   # pipev3 P1
@@ -4724,7 +5373,8 @@ class Pipeline:
                 cur = st.get("impl_version", 1)
                 nv = cur + 1
                 self.check_budget(st)
-                self.guard.diff_patch(st["impl_base_head"], self.task_dir / f"diff_impl_v{cur}.patch")
+                self.guard.diff_patch(st["impl_base_head"], self.task_dir / f"diff_impl_v{cur}.patch",
+                                      arts_rel, self._snapshot_kb())
                 log(self.task_dir, f"IMPL: {self._rework_label(st)} — исполнитель правит до v{nv} по {rw_rev.name}")
                 self._exec_step(
                     st, "revise_impl", "impl", nv, rw_rev.name,
@@ -4744,20 +5394,22 @@ class Pipeline:
                 # pipework3: лимит — на границе после ревью (см. PLAN); версия, уже сделанная
                 # исполнителем, всегда проходит ревью + синтез председателя
                 diff_file = self.task_dir / f"diff_impl_v{cur_v}.patch"
-                self.guard.diff_patch(st["impl_base_head"], diff_file)
+                tree = self.guard.diff_patch(st["impl_base_head"], diff_file, arts_rel, self._snapshot_kb())
+                delta_note = self._record_snapshot(st, cur_v, tree, arts_rel)
                 self.guard.untracked_list("", self.task_dir / f"untracked_impl_v{cur_v}.txt", arts_rel)
                 self.check_budget(st, soft=True)
                 n = self.next_rev_number(st, "impl")
                 rev_file = self.task_dir / f"rev{n:03d}_impl.md"
+                self._mark_review(st, "impl", rev_file)
                 log(self.task_dir, f"IMPL ревью #{it} (rev{n:03d}): impl_report_v{cur_v} + diff")
                 # pipev4 П4: убрано дубль-имя задачи в путях диффа/untracked
                 # (было pipeline/<task>/<task>/diff_impl_v{N}.patch — путь не
                 # существовал, ревьюеры искали файл на ощупь; srocr rev004)
                 artifact_desc = (
                     f"{arts_rel}/impl_report_v{cur_v}.md и дифф {arts_rel}/diff_impl_v{cur_v}.patch "
-                    f"(дифф всех изменений относительно {st['impl_base_head'][:10]}; "
-                    f"новые untracked-файлы: {arts_rel}/untracked_impl_v{cur_v}.txt). "
-                    f"Сверяй отчёт с фактическим диффом и кодом."
+                    f"(дифф всех изменений относительно {st['impl_base_head'][:10]}, включая новые файлы; "
+                    f"список новых untracked-файлов: {arts_rel}/untracked_impl_v{cur_v}.txt). "
+                    f"Сверяй отчёт с фактическим диффом и кодом.{delta_note}"
                 )
                 outside = self._zone_outside(st, arts_rel)
                 if outside:
@@ -4789,6 +5441,7 @@ class Pipeline:
                 except EmptyReviewError as e:
                     self._halt_empty_review(st, "impl", e)
                     return
+                st.pop("inflight_review", None)                          # Н55: ревью завершено и учтено
                 st["impl_iteration"] = it
                 st["spent_usd"] = round(st.get("spent_usd", 0.0) + cost, 4)
                 st.setdefault("review_telemetry", []).append(telemetry)   # pipev3 P1
@@ -5603,6 +6256,39 @@ def cmd_commit_by_plan(cfg: dict, args) -> None:
 # CLI
 # ----------------------------------------------------------------------------
 
+CGROUP_SIZE_RE = re.compile(r"\d+(?:\.\d+)?[KMGTkmgt]?|\d+%|infinity")
+
+
+def cgroup_wrap(cfg: dict, task: str, cmd: list[str], *, which=None, environ: dict | None = None,
+                now: float | None = None) -> tuple[list[str], str]:
+    """Н51/Н52: при `parallel.isolate_cgroup` обернуть команду оркестратора в `systemd-run --user --scope`
+    с MemoryMax/MemorySwapMax. Возвращает (команда, пояснение для консоли/лога). Нет systemd-run или
+    пользовательской сессии systemd — команда НЕ меняется, а пояснение говорит об этом (молча терять
+    изоляцию нельзя: человек рассчитывает на предохранитель). Чистая функция: `which`/`environ`/`now`
+    подменяются в тестах (сам systemd-run инструментом в проверках не запускается)."""
+    par = cfg.get("parallel") if isinstance(cfg.get("parallel"), dict) else {}
+    if not par.get("isolate_cgroup"):
+        return cmd, ""
+    exe = (which or shutil.which)("systemd-run")
+    if not exe:
+        return cmd, ("ВНИМАНИЕ: parallel.isolate_cgroup=true, но systemd-run не найден — оркестратор остаётся в "
+                     "cgroup родителя (гибель родителя его унесёт, лимитов памяти нет)")
+    if not (environ if environ is not None else os.environ).get("XDG_RUNTIME_DIR"):
+        return cmd, ("ВНИМАНИЕ: parallel.isolate_cgroup=true, но нет XDG_RUNTIME_DIR (нет пользовательской сессии "
+                     "systemd) — оркестратор остаётся в cgroup родителя, лимитов памяти нет")
+    stamp = int(time.time() if now is None else now)
+    unit = re.sub(r"[^A-Za-z0-9:_.\\-]", "_", f"duo-{Path(str(cfg.get('repo', ''))).name}-{task}-{stamp}")
+    args = [exe, "--user", "--scope", "--quiet", f"--unit={unit}"]
+    lim = []
+    for key, prop in (("memory_max", "MemoryMax"), ("memory_swap_max", "MemorySwapMax")):
+        v = str(par.get(key) or "").strip()
+        if v:
+            args += ["-p", f"{prop}={v}"]
+            lim.append(f"{prop}={v}")
+    note = f"cgroup: оркестратор в области {unit}.scope" + (f" ({', '.join(lim)})" if lim else " (без лимитов памяти)")
+    return [*args, "--", *cmd], note
+
+
 def _detached_argv(cfg: dict, argv: list[str] | None = None) -> list[str]:
     """R1 (duoportable): argv ребёнка с ЯВНЫМ --repo (глобальный флаг — ДО подкоманды):
     detached-процесс не зависит от cwd родителя и DUO_REPO в его окружении."""
@@ -5630,6 +6316,9 @@ def run_detached(cfg: dict, task: str, argv: list[str] | None = None) -> None:
     # argv=None — ре-экзек текущей командной строки `run ...`; rework --run передаёт свой
     # (в sys.argv тогда лежит `rework ...`, а не `run`)
     cmd = [sys.executable, str(Path(__file__).resolve()), *_detached_argv(cfg, argv), "--fg"]
+    cmd, cg_note = cgroup_wrap(cfg, task, cmd)             # Н51/Н52: собственная область systemd (опция)
+    if cg_note:
+        print(cg_note, flush=True)
     with open(bg_log, "ab") as lf:
         proc = subprocess.Popen(cmd, stdout=lf, stderr=lf, stdin=subprocess.DEVNULL,
                                 start_new_session=True)
@@ -5893,6 +6582,88 @@ def format_status_table(rows: list[dict]) -> str:
     return "\n".join(lines)
 
 
+_FIND_SEC_RE = re.compile(r"^##\s+(?:\d+[.)]?\s*)?замечани", re.IGNORECASE | re.MULTILINE)
+_FIND_ITEM_RE = re.compile(r"^ ?(?:\d+[.)]|[-*•])\s+\S")
+_FIND_NONE_RE = re.compile(r"(?:блокер|существенн)\w*\s*[:—-]?\s*(?:нет|отсутств|не найден)", re.IGNORECASE)
+_FIND_LATENT_RE = re.compile(r"латентн|недостижим|потерь данных нет|не воспроизводится|только честност", re.IGNORECASE)
+
+
+def rev_findings(text: str) -> dict | None:
+    """Н48: сколько в отчёте ревью «обязательных» пунктов (блокер + существенное) — эвристика по ключевым
+    словам в строках-пунктах раздела «Замечания»; None — раздела нет (формат другой). `latent` — из них с
+    пометкой «латентно / недостижимо / потерь данных нет» (граница «обязательно ↔ backlog» плавает от раунда
+    к раунду, поле: 4 из 5 таких пунктов). Не вердикт и не гейт: только материал для решения человека."""
+    m = _FIND_SEC_RE.search(text or "")
+    if not m:
+        return None
+    rest = (text or "")[m.end():]
+    nxt = re.search(r"^## ", rest, re.MULTILINE)
+    sec = rest[: nxt.start()] if nxt else rest
+    out = {"blocker": 0, "major": 0, "cosmetic": 0, "latent": 0}
+    for ln in sec.splitlines():
+        if not _FIND_ITEM_RE.match(ln) or _FIND_NONE_RE.search(ln):
+            continue
+        low = ln.lower()
+        pos = {k: low.find(w) for k, w in (("blocker", "блокер"), ("major", "существенн"),
+                                           ("cosmetic", "косметик")) if w in low}
+        if not pos:
+            continue
+        kind = min(pos, key=lambda k: pos[k])
+        out[kind] += 1
+        if kind != "cosmetic" and _FIND_LATENT_RE.search(ln):
+            out["latent"] += 1
+    return out
+
+
+def convergence_summary(task_dir: Path, st: dict, phase: str) -> str:
+    """Н48: сводка сходимости фазы для сообщения об остановке по лимиту итераций — раньше там было лишь
+    «подними лимит», и решение «продолжать или остановиться» принималось вслепую. Ревью по раундам:
+    вердикт, число «обязательных» (блокер + существенное, эвристика), цена. Пустая строка — данных мало
+    (< 2 ревью) либо сбой разбора: сообщение об остановке от сводки не зависит."""
+    try:
+        rows = [v for v in (st.get("verdicts") or [])
+                if v.get("phase") == phase and str(v.get("rev", "")).startswith("rev")]
+        if len(rows) < 2:
+            return ""
+        tel = [t for t in (st.get("review_telemetry") or []) if isinstance(t, dict) and t.get("phase") == phase]
+        costs = [t.get("cost_usd") for t in tel] if len(tel) == len(rows) else [None] * len(rows)
+        cells, must, latent = [], [], []
+        for v, c in zip(rows, costs, strict=True):
+            f = rev_findings((task_dir / v["rev"]).read_text(encoding="utf-8", errors="replace"))
+            n = None if f is None else f["blocker"] + f["major"]
+            must.append(n)
+            if f and f["latent"]:
+                latent.append(f"{v['rev'].split('_')[0]}: {f['latent']}")
+            price = f" ${float(c):.2f}" if isinstance(c, (int, float)) else ""
+            cells.append(f"{v['rev'].split('_')[0]} {v.get('verdict', '?')} "
+                         f"{'?' if n is None else n}{price}")
+        known = [n for n in must if n is not None]
+        trend = ""
+        if len(known) >= 2:
+            trend = (" — число обязательных убывает" if known[-1] < known[0] else
+                     " — число обязательных НЕ убывает")
+        late = f"; с пометкой «латентно/недостижимо»: {', '.join(latent)}" if latent else ""
+        return (f" Сходимость (ревью: вердикт, обязательных≈ блокер+существенных, цена): {' → '.join(cells)}"
+                f"{trend}{late}. Подсчёт — эвристика по тексту ревью; если остаток латентный или порождён "
+                f"правкой прошлого раунда — решай «принять с backlog»/«+1 итерация», а не слепо поднимай лимит.")
+    except Exception:
+        return ""
+
+
+def review_transport_totals(st: dict) -> dict:
+    """Н49: суммарные счётчики транспорта ревью серии — по завершённым ревью (`review_telemetry`) И по
+    оборванным исключением (`review_aborted`: ретраи, которые раньше терялись вместе с ревью). Плюс число
+    остановок по квоте провайдера. Единственный источник для `status` и `status --json`."""
+    tel = [t for t in (st.get("review_telemetry") or []) if isinstance(t, dict)]
+    ab = st.get("review_aborted") if isinstance(st.get("review_aborted"), dict) else {}
+    keys = (*REVIEW_EV_ZERO, "empty_retries")
+    out = {k: sum(int(t.get(k, 0) or 0) for t in tel) + int(ab.get(k, 0) or 0) for k in keys}
+    out["reviews"] = len(tel)
+    out["aborted_reviews"] = int(ab.get("count", 0) or 0)
+    out["quota_halts"] = int(st.get("quota_halts", 0) or 0)
+    return out
+
+
 def accepted_plan_summary(st: dict) -> str | None:
     """Сводка «что принято» для момента решения о запуске имплементации (Н11 полевой проверки):
     версия плана, ревью-приёмка, эрраты, зона записи, потрачено. Только уже имеющиеся поля state —
@@ -5972,12 +6743,9 @@ def cmd_status(cfg: dict, args) -> None:
         console_age = max(0, int(time.time() - bg_log.stat().st_mtime))
     except OSError:
         console_age = None
-    tel = [t for t in (st.get("review_telemetry") or []) if isinstance(t, dict)]
-    stubs = sum(int(t.get("stub_retries", 0) or 0) for t in tel)
-    tretry = sum(int(t.get("transport_retries", 0) or 0) for t in tel)
-    empty = sum(int(t.get("empty_retries", 0) or 0) for t in tel)
-    extra_ev = {k: sum(int(t.get(k, 0) or 0) for t in tel)
-                for k in ("incomplete_retries", "overload_retries", "limit_retries", "stitched")}
+    rt = review_transport_totals(st)
+    stubs, tretry, empty = rt["stub_retries"], rt["transport_retries"], rt["empty_retries"]
+    extra_ev = {k: rt[k] for k in ("incomplete_retries", "overload_retries", "limit_retries", "stitched")}
     wt = p.isolation == "worktree"
     deny = executor_deny_rules(cfg)
     res_names = sorted({str(n) for n in (cfg.get("resources") or []) if isinstance(n, str)})
@@ -5990,7 +6758,11 @@ def cmd_status(cfg: dict, args) -> None:
             "worktree": str(p.work_path) if wt else None,
             "branch": f"{cfg['git']['branch_prefix']}{args.task}" if wt else None,
             "budget": {"spent_usd": round(float(st.get("spent_usd", 0) or 0), 4),
-                       "limit_usd": limit, "extra_usd": extra},
+                       "limit_usd": limit, "extra_usd": extra,
+                       "unrecorded_calls": int(st.get("unrecorded_count", 0) or 0),
+                       "unrecorded_minutes": round(sum(float(c.get("minutes") or 0)
+                                                       for c in (st.get("unrecorded_calls") or [])
+                                                       if isinstance(c, dict)), 1)},
             "claim": ({"released": claim_released_now, "paths": len(claim.get("paths") or []),
                        "declared": bool(claim.get("declared"))} if isinstance(claim, dict) else None),
             "process": {"kind": info["kind"], "alive": bool(info["alive"]), "age_sec": info.get("age_sec"),
@@ -5998,7 +6770,8 @@ def cmd_status(cfg: dict, args) -> None:
             "halt": info.get("halt") or None, "stop_reason": info.get("stop_reason") or None,
             "accepted_plan": summ if st.get("phase") in ("impl_pending", "impl", "done") else None,
             "review_transport": {"stub_retries": stubs, "transport_retries": tretry,
-                                 "empty_retries": empty, "reviews": len(tel), **extra_ev},
+                                 "empty_retries": empty, "reviews": rt["reviews"], **extra_ev,
+                                 "aborted_reviews": rt["aborted_reviews"], "quota_halts": rt["quota_halts"]},
             "guard": {"executor_deny": deny, "resources": res_state},
             "models": models_summary(cfg, st.get("mode") or "duo", st.get("executor_model") or ""),
             "waiting": waiting_info(st),
@@ -6008,6 +6781,11 @@ def cmd_status(cfg: dict, args) -> None:
     print(json.dumps(st, ensure_ascii=False, indent=2))
     print(f"бюджет: ${st.get('spent_usd', 0):.2f} / ${limit:g}"
           + (f" (в т.ч. добавка серии ${extra:g})" if extra else ""))
+    if st.get("unrecorded_count"):
+        mins = sum(float(c.get("minutes") or 0) for c in (st.get("unrecorded_calls") or []) if isinstance(c, dict))
+        print(f"неучтённых оборванных вызовов модели: {int(st['unrecorded_count'])}"
+              + (f" (≈ {mins:.0f} мин работы)" if mins else "")
+              + " — оплачены, но в бюджет не вошли: реальные траты больше spent_usd")
     wt_note = (f", дерево {p.work_path}, ветка {cfg['git']['branch_prefix']}{args.task}" if wt else "")
     print(f"режим: {st.get('mode') or '— (не записан; будет duo)'}, изоляция: {p.isolation}{wt_note}")
     pin_note = "" if st.get("executor_model") else " (модель исполнителя ещё не закреплена: по конфигу)"
@@ -6042,6 +6820,9 @@ def cmd_status(cfg: dict, args) -> None:
     if info.get("halt"):
         h = info["halt"]
         print(f"остановка: kind={h.get('kind')} phase={h.get('phase')} resumable={h.get('resumable')} — {info['stop_reason']}")
+        if h.get("cause") == "quota":
+            print(f"причина: квота провайдера; сброс {format_reset(h.get('reset_at'))}; продолжить после сброса — "
+                  f"`duo run --task {args.task} --resume --wait-quota` (или надзор с auto_resume)")
     wait = waiting_info(st)
     if wait and (wait["phase"] != "done" or wait["min"] < 24 * 60):     # давно закрытые серии не шумим
         age = format_wait_age(wait["min"])
@@ -6058,12 +6839,13 @@ def cmd_status(cfg: dict, args) -> None:
         if st.get("phase") == "impl_pending":
             print(f"решение за человеком: прочти plan_v{st.get('plan_version')}.md и эрраты, затем "
                   f"`duo run --task {args.task} --continue`")
-    if stubs or tretry or empty or any(extra_ev.values()):
+    if stubs or tretry or empty or any(extra_ev.values()) or rt["aborted_reviews"] or rt["quota_halts"]:
         print(f"транспорт ревью (деградации, на вердикт обычно не влияют): ответов-заглушек {stubs}, "
               f"транспортных повторов {tretry}, пустых ревью {empty}, ретраев формата "
               f"{extra_ev['incomplete_retries']}, пауз на перегрузку {extra_ev['overload_retries']}, "
               f"ретраев после лимита вывода {extra_ev['limit_retries']}, склеек {extra_ev['stitched']} "
-              f"— по {len(tel)} ревью")
+              f"— по {rt['reviews']} ревью; оборванных ревью {rt['aborted_reviews']}, остановок по квоте "
+              f"{rt['quota_halts']}")
 
 
 def cmd_accept(cfg: dict, args) -> int:
@@ -6206,8 +6988,12 @@ def cmd_wait(cfg: dict, args) -> int:
             status = "idle"
         if status:
             h = info.get("halt") or {}
+            # Н46: причина внутри kind и срок сброса квоты — помощник решает «ждать до HH:MM» без чтения state
+            cause = (f" cause={h['cause']}"
+                     + (f" reset={datetime.fromtimestamp(float(h['reset_at']), UTC).strftime('%Y-%m-%dT%H:%MZ')}"
+                        if h.get("reset_at") else "") if h.get("cause") else "")
             print(f"WAIT-RESULT: {status} task={info['task']} phase={info['phase']} "
-                  f"halt={h.get('kind', '-')} resumable={h.get('resumable', '-')} "
+                  f"halt={h.get('kind', '-')}{cause} resumable={h.get('resumable', '-')} "
                   f"spent=${info.get('spent_usd', 0):.2f} :: {str(info.get('stop_reason') or '')[:300]}", flush=True)
             return WAIT_EXIT[status]
         if t_end and time.time() >= t_end:
@@ -6238,7 +7024,8 @@ def phase_event_key(info: dict) -> str:
 
 
 def supervise_tick(cfg: dict, *, auto_resume: bool | None = None, now: float | None = None,
-                   state_path: Path | None = None, spawn=None, notify=None, dry_run: bool = False) -> list[dict]:
+                   state_path: Path | None = None, spawn=None, notify=None, dry_run: bool = False,
+                   env_check=None, notify_cmd=None) -> list[dict]:
     """Один тик надзора (stateless между запусками; для systemd-timer / cron). Состояние
     дедупликации алертов и счётчики авто-возобновлений — вне репозитория (XDG_STATE_HOME),
     в репо ничего не пишется (GitGuard вычищал бы лишнее под pipeline/).
@@ -6249,8 +7036,21 @@ def supervise_tick(cfg: dict, *, auto_resume: bool | None = None, now: float | N
 
     dead / halted с разрешённым kind → алерт (один раз на событие) и, при auto_resume,
     `run --task T --resume` detached; потолок max_resumes за resume_window_sec на задачу.
-    Остановки limit/budget/artifact_missing/errata — только алерт: решение за человеком."""
+    Остановки limit/budget/artifact_missing/errata — только алерт: решение за человеком.
+
+    Н50: перед возобновлением — предполёт окружения САМОГО надзора (его PATH наследует spawn-ребёнок):
+    `claude` не найден → действие `env-broken` (без spawn и без траты max_resumes), причина — в алерте.
+    `env_check(cfg) -> str|None` подменяет проверку; без подмены она работает только при настоящем spawn
+    (подставной spawn в тестах не должен зависеть от PATH машины)."""
     sup = sup_cfg(cfg)
+    check = env_check if env_check is not None else (claude_env_problem if spawn is None else None)
+    env_memo: list = []
+
+    def env_problem() -> str | None:
+        if not env_memo:
+            env_memo.append(check(cfg) if check else None)
+        return env_memo[0]
+
     now = time.time() if now is None else now
     auto = sup["auto_resume"] if auto_resume is None else auto_resume
     spath = state_path or _supervisor_state_path()
@@ -6285,13 +7085,11 @@ def supervise_tick(cfg: dict, *, auto_resume: bool | None = None, now: float | N
                              else "план принят — ждёт запуска имплементации")
                     act = {"task": task, "project": project, "kind": info["phase"], "action": "notice",
                            "reason": label}
-                    if not (cfg.get("notify") or {}).get("desktop"):
-                        act["notify"] = "выключено (notify.desktop=false)"
-                    elif dry_run:
+                    if dry_run:
                         act["notify"] = "dry-run: не отправляется"
                     else:
-                        act["notify"] = _deliver_notice(notify, f"duo {project}/{task}: {label}",
-                                                        f"потрачено ${info.get('spent_usd', 0):.2f}")
+                        act["notify"] = _notify_all(cfg, notify, notify_cmd, f"duo {project}/{task}: {label}",
+                                                    f"потрачено ${info.get('spent_usd', 0):.2f}")
                     actions.append(act)
             continue
         if info["kind"] not in ("dead", "halted"):
@@ -6300,40 +7098,158 @@ def supervise_tick(cfg: dict, *, auto_resume: bool | None = None, now: float | N
         event_key = f"{info['kind']}:{(info.get('halt') or {}).get('at', '')}:{info['phase']}:{int(info.get('spent_usd', 0) * 100)}"
         act = {"task": task, "project": project, "kind": info["kind"], "action": "none",
                "reason": info.get("stop_reason", "")}
+        if info["kind"] == "dead":
+            # Н54: у `dead` нет stop_reason — диагноз по файлам серии (трейс либо «убит снаружи» + что было в полёте)
+            try:
+                act["reason"] = dead_hint(st_file.parent, load_json(st_file))
+            except (OSError, ValueError):
+                act["reason"] = "оркестратор умер без halt"
+        halt = info.get("halt") or {}
+        resumable = (info["kind"] == "dead" or
+                     (halt.get("resumable") and (halt.get("kind") in sup["auto_resume_kinds"])))
+        quota = info["kind"] == "halted" and halt.get("cause") == "quota"
+        envp = env_problem() if (auto and resumable) else None
         if rec.get("alerted") != event_key:
             rec["alerted"] = event_key
             act["action"] = "alert"
-            if not (cfg.get("notify") or {}).get("desktop"):
-                act["notify"] = "выключено (notify.desktop=false)"
-            elif dry_run:
+            if dry_run:
                 act["notify"] = "dry-run: не отправляется"
             elif (info.get("halt") or {}).get("notified"):
                 act["notify"] = "уже принято демоном при остановке (оркестратор)"
             else:
-                act["notify"] = _deliver_notice(notify, f"duo {project}/{task}: {info['kind']}",
-                                                (info.get("stop_reason") or "оркестратор умер без halt")[:200])
-        resumable = (info["kind"] == "dead" or
-                     ((info.get("halt") or {}).get("resumable") and (info["halt"].get("kind") in sup["auto_resume_kinds"])))
+                body = (info.get("stop_reason") or act["reason"] or "оркестратор умер без halt")[:200]
+                if envp:
+                    body += f" | авто-возобновление невозможно: {envp[:160]}"
+                act["notify"] = _notify_all(cfg, notify, notify_cmd, f"duo {project}/{task}: {info['kind']}", body)
+        # Н46/Н58: остановка по квоте провайдера возобновляется только ПОСЛЕ сброса и не тратит max_resumes:
+        # прежде три авто-возобновления сгорали на ожидании, которое заведомо не кончится, а к сбросу
+        # квоты потолок уже был исчерпан. Свой потолок (max_quota_resumes) защищает лишь от петли «сброс в
+        # прошлом, а квоты нет».
+        wkey = "quota_resumes" if quota else "resumes"
+        cap = sup["max_quota_resumes"] if quota else sup["max_resumes"]
         if auto and resumable:
-            recent = [t for t in rec.get("resumes", []) if now - t < sup["resume_window_sec"]]
-            if len(recent) >= sup["max_resumes"]:
+            recent = [t for t in rec.get(wkey, []) if now - t < sup["resume_window_sec"]]
+            reset = halt.get("reset_at") if quota else None
+            if quota and not reset:
+                act["action"] = "quota-no-reset"           # метки сброса нет — решает человек, а не тик в 2 мин
+            elif quota and now < float(reset) + quota_cfg(cfg)["resume_margin_sec"]:
+                act["action"] = "quota-wait"
+                act["reason"] = f"квота провайдера: сброс {format_reset(float(reset))}"
+            elif envp:
+                act["action"] = "env-broken"                # Н50: возобновление упало бы так же — не тратим max_resumes
+                act["reason"] = f"авто-возобновление невозможно: {envp}"
+            elif len(recent) >= cap:
                 act["action"] = "resume-limit"
             elif dry_run:
                 act["action"] = "would-resume"
             else:
                 recent.append(now)
-                rec["resumes"] = recent
+                rec[wkey] = recent
                 try:
                     spawn(task)
                     act["action"] = "resumed"
                 except SystemExit as e:
                     act["action"] = f"resume-failed: {e}"
-        rec["resumes"] = [t for t in rec.get("resumes", []) if now - t < sup["resume_window_sec"]]
+        for k in ("resumes", "quota_resumes"):
+            rec[k] = [t for t in rec.get(k, []) if now - t < sup["resume_window_sec"]]
         actions.append(act)
     if not dry_run:
         spath.parent.mkdir(parents=True, exist_ok=True)
         save_json(spath, sstate)
     return actions
+
+
+def notify_command_cfg(cfg: dict) -> list[str]:
+    """argv второго канала уведомлений (`notify.command`); [] — не настроен либо настроен мусором."""
+    n = cfg.get("notify") if isinstance(cfg.get("notify"), dict) else {}
+    cmd = n.get("command")
+    if isinstance(cmd, list) and cmd and all(isinstance(x, str) and x for x in cmd):
+        return list(cmd)
+    return []
+
+
+def run_notify_command(cfg: dict, title: str, body: str, run=None) -> str:
+    """Н54: отправить уведомление внешней командой (`notify.command`). "" — канал не настроен; иначе ИТОГ
+    строкой (как у `_deliver_notice`): начинается с «доставлено» либо «НЕ доставлено». Без shell: заголовок и
+    текст попадают в argv/окружение как данные, а не как код."""
+    cmd = notify_command_cfg(cfg)
+    if not cmd:
+        return ""
+    n = cfg.get("notify") if isinstance(cfg.get("notify"), dict) else {}
+    try:
+        timeout = float(n.get("command_timeout_sec", 20) or 20)
+    except (TypeError, ValueError):
+        timeout = 20.0
+    argv = [a.replace("{title}", title).replace("{body}", body) for a in cmd]
+    env = {**os.environ, "DUO_NOTIFY_TITLE": title, "DUO_NOTIFY_BODY": body}
+    try:
+        res = (run or subprocess.run)(argv, timeout=timeout, capture_output=True, env=env,
+                                      stdin=subprocess.DEVNULL)
+    except FileNotFoundError:
+        return f"НЕ доставлено: команда `{cmd[0]}` не найдена"
+    except subprocess.TimeoutExpired:
+        return f"НЕ доставлено: команда `{cmd[0]}` не завершилась за {timeout:.0f} с"
+    except Exception as e:
+        return f"НЕ доставлено: {type(e).__name__}: {e}"[:160]
+    rc = getattr(res, "returncode", 0)
+    if rc:
+        err = getattr(res, "stderr", b"") or b""
+        err = err.decode(errors="replace") if isinstance(err, bytes) else str(err)
+        return f"НЕ доставлено: команда `{cmd[0]}` rc={rc} {err.strip()[:120]}".rstrip()
+    return f"доставлено (команда `{cmd[0]}` rc=0)"
+
+
+def dead_hint(task_dir: Path, st: dict | None = None) -> str:
+    """Н54: почему серия `dead` (оркестратор умер без `halt`) — по файлам серии, без журналов ОС. Трейс в
+    `orchestrator_bg.log` → исключение; иначе процесс убит СНАРУЖИ (OOM-убийца, kill, выключение машины) —
+    у такой смерти следов в серии нет, поэтому называем последний признак жизни и где искать причину."""
+    task_dir = Path(task_dir)
+    st = st or {}
+    parts: list[str] = []
+    bg = task_dir / "orchestrator_bg.log"
+    try:
+        tail = bg.read_bytes()[-4000:].decode("utf-8", "replace")
+    except OSError:
+        tail = ""
+    if "Traceback (most recent call last)" in tail:
+        last = [ln for ln in tail.splitlines() if ln.strip()][-1].strip()[:160]
+        parts.append(f"исключение в оркестраторе (трейс в orchestrator_bg.log): {last}")
+    else:
+        parts.append("записи СТОП и трейса нет — процесс убит снаружи (OOM-убийца, kill, выключение/"
+                     "перезагрузка машины)")
+        when = ""
+        for f in (bg, task_dir / "orchestrator.log"):
+            try:
+                when = datetime.fromtimestamp(f.stat().st_mtime).strftime("%H:%M:%S %d.%m")
+                break
+            except OSError:
+                continue
+        if when:
+            parts.append(f"последний признак жизни — {when}; причину ищи в журнале ОС на это время "
+                         f"(`journalctl --user --since …`, строки про OOM/killed)")
+    inf = st.get("inflight") if isinstance(st.get("inflight"), dict) else None
+    if inf:
+        parts.append(f"в полёте был шаг исполнителя {inf.get('step')} (с {inf.get('at')}) — его цена в spent_usd "
+                     f"не вошла")
+    ir = st.get("inflight_review") if isinstance(st.get("inflight_review"), dict) else None
+    if ir:
+        parts.append(f"в полёте было ревью {ir.get('rev')} (с {ir.get('at')}) — его цена в spent_usd не вошла")
+    return "; ".join(parts)
+
+
+def _notify_all(cfg: dict, notify, notify_cmd, title: str, body: str) -> str:
+    """Все включённые каналы надзора одной строкой итога: десктоп (`notify.desktop`) и команда
+    (`notify.command`). Ни один не включён — прежний текст «выключено (notify.desktop=false)»."""
+    desktop = bool((cfg.get("notify") or {}).get("desktop"))
+    has_cmd = bool(notify_command_cfg(cfg))
+    if not desktop and not has_cmd:
+        return "выключено (notify.desktop=false)"
+    parts = []
+    if desktop:
+        parts.append(_deliver_notice(notify, title, body))
+    if has_cmd:
+        parts.append("команда: " + (notify_cmd or run_notify_command)(cfg, title, body))
+    return " | ".join(parts)
 
 
 def _deliver_notice(notify, title: str, body: str) -> str:
@@ -6826,10 +7742,15 @@ def _gates_resolve(cfg: dict) -> dict:
     for raw in gates.get("steps") or []:
         argv = [str(a).replace("{py}", str(py)).replace("{pybin}", str(pybin))
                 .replace("{cpus}", cpus) for a in (raw.get("argv") or [])]
-        steps.append({"name": str(raw.get("name", "")), "argv": argv,
-                      "pp": bool(raw.get("pp", False)),
-                      "timeout": int(raw.get("timeout", 900)),
-                      "summary": str(raw.get("summary") or "last_line")})
+        step = {"name": str(raw.get("name", "")), "argv": argv,
+                "pp": bool(raw.get("pp", False)),
+                "timeout": int(raw.get("timeout", 900)),
+                "summary": str(raw.get("summary") or "last_line")}
+        it = raw.get("idle_timeout")
+        if isinstance(it, (int, float)) and not isinstance(it, bool) and it > 0:
+            # Н59: отсечка по ТИШИНЕ вывода (сек), в отличие от общего `timeout`; ключ есть только у заданных
+            step["idle_timeout"] = float(it)
+        steps.append(step)
     return {"py": py, "pybin": pybin, "cpus": cpus, "stubs_dir": stubs_dir, "steps": steps}
 
 
@@ -6838,9 +7759,104 @@ def gates_steps(cfg: dict) -> list[dict]:
     return _gates_resolve(cfg)["steps"]
 
 
-def _gates_default_runner(argv: list[str], *, cwd: Path, env: dict, timeout: float | None) -> tuple[int, str]:
+GATES_HEARTBEAT_SEC = 60.0
+
+
+def _gates_stream_runner(argv: list[str], *, cwd: Path, env: dict, timeout: float | None, idle_timeout: float,
+                         label: str = "", heartbeat: float | None = None) -> tuple[int, str]:
+    """Н59: раннер шага с отсечкой по ТИШИНЕ вывода и пульсом. Поле: `dotnet test` завис (`testhost` без CPU,
+    последний вывод на 8-й секунде) и стоял до внешнего kill — общий `timeout` шага (900 с) для такого
+    случая слишком груб, а о ходе шага не было видно ничего. Здесь: stdout+stderr читаются потоком;
+    нет ни байта `idle_timeout` секунд — убивается ВСЯ группа процессов (не только родитель: осиротевший
+    `testhost` остаётся держать порты/файлы), rc=124, в логе шага — всё, что успело напечататься, и пометка
+    IDLE-TIMEOUT; каждые `heartbeat` секунд — строка пульса (сколько идёт, сколько вывода, сколько молчит)."""
+    hb = GATES_HEARTBEAT_SEC if heartbeat is None else heartbeat
+    try:
+        proc = subprocess.Popen(argv, cwd=cwd, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                text=True, start_new_session=True)
+    except FileNotFoundError:
+        return 127, f"BIN MISSING: {argv[0]}"
+    q: queue.Queue[str | None] = queue.Queue()
+
+    def reader() -> None:
+        try:
+            for line in proc.stdout:                       # type: ignore[union-attr]
+                q.put(line)
+        finally:
+            q.put(None)
+
+    threading.Thread(target=reader, daemon=True).start()
+    chunks: list[str] = []
+    size = 0
+    start = last_out = last_beat = time.time()
+    verdict = ""
+
+    def kill_group() -> None:
+        for sig in (signal.SIGTERM, signal.SIGKILL):
+            try:
+                os.killpg(proc.pid, sig)
+            except (ProcessLookupError, PermissionError):
+                return
+            try:
+                proc.wait(timeout=5)
+                return
+            except subprocess.TimeoutExpired:
+                continue
+
+    while True:
+        try:
+            line = q.get(timeout=1.0)
+        except queue.Empty:
+            if proc.poll() is not None:
+                try:                                       # процесс вышел, а EOF держат внуки — дочитать и выйти
+                    while True:
+                        line = q.get(timeout=0.5)
+                        if line is None:
+                            break
+                        chunks.append(line)
+                except queue.Empty:
+                    pass
+                break
+        else:
+            if line is None:
+                break
+            chunks.append(line)
+            size += len(line)
+            last_out = time.time()
+        # лимиты проверяются КАЖДУЮ итерацию, не только при пустой очереди: болтливый шаг не должен
+        # уходить от общего таймаута
+        now = time.time()
+        if now - last_out > idle_timeout:
+            verdict = (f"\nIDLE-TIMEOUT: шаг {label or argv[0]} молчит {int(now - last_out)} с "
+                       f"(gates.steps[].idle_timeout={idle_timeout:g}); убита группа процессов. "
+                       f"Вывод выше — всё, что шаг успел напечатать.")
+            kill_group()
+            break
+        if timeout is not None and now - start > timeout:
+            verdict = f"\nTIMEOUT после {timeout}s (общий лимит шага)"
+            kill_group()
+            break
+        if hb and now - last_beat >= hb:
+            print(f"    … {label or argv[0]}: идёт {int(now - start)} с, вывод {size} Б, молчит "
+                  f"{int(now - last_out)} с (отсечка по тишине {idle_timeout:g} с)", flush=True)
+            last_beat = now
+    try:
+        rc = proc.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        rc = -9
+    if verdict:
+        return 124, "".join(chunks) + verdict
+    return rc, "".join(chunks)
+
+
+def _gates_default_runner(argv: list[str], *, cwd: Path, env: dict, timeout: float | None,
+                          idle_timeout: float | None = None, label: str = "") -> tuple[int, str]:
     """Реальный раннер: subprocess без shell. Таймаут → rc=124 + пометка TIMEOUT;
-    отсутствующий бин (rc=127) — обычный красный шаг, а не traceback сквозь main."""
+    отсутствующий бин (rc=127) — обычный красный шаг, а не traceback сквозь main.
+    `idle_timeout` (Н59) — шаг с отсечкой по тишине вывода: потоковый раннер (`_gates_stream_runner`)."""
+    if idle_timeout:
+        return _gates_stream_runner(argv, cwd=cwd, env=env, timeout=timeout, idle_timeout=idle_timeout,
+                                    label=label)
     try:
         p = subprocess.run(argv, cwd=cwd, env=env, capture_output=True, text=True, timeout=timeout)
         return p.returncode, (p.stdout or "") + (p.stderr or "")
@@ -6877,6 +7893,10 @@ def cmd_gates(cfg: dict, args, runner: Callable | None = None) -> int:
     if not steps:
         print("gates.steps не заданы в .duo/config.json (пример — docs/PROJECT-SETUP.md)")
         return 2
+    # Н59: мусорный idle_timeout не должен молча выключать защиту от зависания шага
+    bad_steps = [x for x in guard_config_problems(cfg) if x.startswith("gates.steps")]
+    if bad_steps:
+        sys.exit("ОТКАЗ: ошибки gates.steps в конфиге: " + "; ".join(bad_steps))
     cfg_py = (cfg.get("gates") or {}).get("python")
     if cfg_py and not os.access(g["py"], os.X_OK):
         sys.exit(f"gates.python={g['py']} не найден или не исполняем (другой стенд? путь интерпретатора "
@@ -7011,7 +8031,10 @@ def cmd_gates(cfg: dict, args, runner: Callable | None = None) -> int:
             if step["pp"]:
                 env["PYTHONPATH"] = (f"{stubs_dir}:{copy_dir}" if stubs_dir is not None else str(copy_dir))
             print(f"[{step['name']}] {shlex.join(step['argv'])[:120]} …")
-            rc, out = run(step["argv"], cwd=copy_dir, env=env, timeout=step["timeout"])
+            # idle_timeout/label — только шагам с отсечкой по тишине (Н59): подставные раннеры без этих
+            # параметров (тесты, внешние обёртки) и шаги без них вызываются прежней сигнатурой
+            kw = {"idle_timeout": step["idle_timeout"], "label": step["name"]} if step.get("idle_timeout") else {}
+            rc, out = run(step["argv"], cwd=copy_dir, env=env, timeout=step["timeout"], **kw)
             (log_dir / f"{step['name']}.txt").write_text(out, encoding="utf-8")
             note(f"{step['name']} rc={rc} : {_gates_summary_extract(step['summary'], out)}")
             print(f"    rc={rc}")
@@ -7231,6 +8254,9 @@ def main() -> None:
     p.add_argument("--resume", dest="resume", action="store_true",
                    help="pipework3: возобновить остановку с машинной записью halt (транспорт/лимит/бюджет/артефакт) "
                         "с места остановки; в отличие от --continue НЕ пересекает паузу impl_pending")
+    p.add_argument("--wait-quota", dest="wait_quota", action="store_true",
+                   help="Н46: с --resume после остановки по квоте провайдера (halt.cause=quota) — дождаться времени "
+                        "сброса (+ quota.resume_margin_sec) и продолжить; заменяет самодельные циклы «проба → resume»")
     p.add_argument("--add-budget", type=float, default=0.0, metavar="USD",
                    help="pipework3: добавить USD к бюджету ЭТОЙ серии (state.budget_extra_usd), без правки config.json")
     p.add_argument("--add-iterations", type=int, default=0, metavar="N",
@@ -7412,7 +8438,8 @@ def main() -> None:
                  executor_model=getattr(args, "executor_model", None)).run(
             force_continue=args.force_continue, add_budget=args.add_budget, add_iterations=args.add_iterations,
             resume=args.resume, allow_shared_parallel=args.allow_shared_parallel,
-            ignore_claims=args.ignore_claims, wait_resources=args.wait_resources)
+            ignore_claims=args.ignore_claims, wait_resources=args.wait_resources,
+            wait_quota=args.wait_quota)
     elif args.cmd == "review":
         members = args.members.split(",") if args.members else None
         Pipeline(cfg, args.task).review_once(args.artifact, args.phase, members)

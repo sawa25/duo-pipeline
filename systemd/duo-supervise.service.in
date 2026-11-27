@@ -7,6 +7,9 @@ Type=oneshot
 # включая оркестратор, который supervise только что запустил detached.
 KillMode=process
 Environment=DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/%U/bus
+# PATH user-сервиса урезан: если `claude` — npm-скрипт (`#!/usr/bin/env node`), без каталога node возобновление падает
+# FileNotFoundError. Добавьте строку Environment=PATH=<каталог claude>:<каталог node>:/usr/bin:/bin либо задайте claude_bin
+# в конфиге (docs/CHEATSHEET-WATCHDOG-FAILSAFE.md, чек-лист, п. 0).
 # Проекты берутся из реестра ~/.config/duo-pipeline/projects.json (duo setup / duo projects --add),
 # рабочий каталог не нужен: каждому перезапуску передаётся --repo.
 ExecStart=@ROOT@/bin/duo supervise

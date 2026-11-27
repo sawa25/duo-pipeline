@@ -86,7 +86,8 @@ def test_status_json_is_a_single_parsable_object(tmp_path: Path, capsys):
     assert "план v2 принят" in obj["accepted_plan"]
     assert obj["review_transport"] == {"stub_retries": 0, "transport_retries": 0, "empty_retries": 0, "reviews": 0,
                                        "incomplete_retries": 0, "overload_retries": 0, "limit_retries": 0,
-                                       "stitched": 0}      # Н38: классы «неполного отчёта» добавлены ключами
+                                       "stitched": 0,      # Н38: классы «неполного отчёта» добавлены ключами
+                                       "aborted_reviews": 0, "quota_halts": 0}    # Н49/Н46
     assert obj["state"]["plan_version"] == 2                               # полное состояние — внутри
     assert obj["isolation"] == "shared" and obj["worktree"] is None and obj["branch"] is None
 
@@ -103,7 +104,7 @@ def test_status_json_degradation_and_no_summary_before_accept(tmp_path: Path, ca
     assert obj["accepted_plan"] is None and obj["claim"] is None
     assert obj["review_transport"] == {"stub_retries": 2, "transport_retries": 1, "empty_retries": 1, "reviews": 2,
                                        "incomplete_retries": 0, "overload_retries": 0, "limit_retries": 0,
-                                       "stitched": 0}
+                                       "stitched": 0, "aborted_reviews": 0, "quota_halts": 0}
 
 
 def test_status_plain_output_is_unchanged_and_not_pure_json(tmp_path: Path, capsys):

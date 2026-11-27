@@ -39,7 +39,7 @@
   "parallel": {
     "shared_ok": [],
     "sync_base_at_impl": true,
-    "_comment": "параллельные серии (run --worktree): shared_ok — globs файлов, пересечение по которым НЕ блокирует старт имплементации (напр. doc/TODO.md); sync_base_at_impl — перед первой имплементацией подтянуть базу worktree к HEAD основного дерева (только fast-forward и только при чистом worktree)"
+    "_comment": "параллельные серии (run --worktree): shared_ok — globs файлов, пересечение по которым НЕ блокирует старт имплементации (напр. doc/TODO.md); sync_base_at_impl — перед первой имплементацией подтянуть базу worktree к HEAD основного дерева (только fast-forward и только при чистом worktree); isolate_cgroup/memory_max/memory_swap_max (Н51/Н52, по умолчанию выкл.) — запуск серии в собственной области systemd-run --user --scope с лимитами памяти (docs/PROJECT-SETUP.md)"
   },
   "limits": {
     "max_plan_iterations": 24,
@@ -98,7 +98,7 @@
     ],
     "max_resumes": 3,
     "resume_window_sec": 21600,
-    "_comment": "штатный надзор: `duo_pipeline.py supervise` (systemd-timer, см. systemd/) — dead/halted → алерт; авто-возобновляются ТОЛЬКО transport/crash (потолок max_resumes за окно); limit/budget/errata/artifact_missing/review_empty/review_incomplete — решение человека"
+    "_comment": "штатный надзор: `duo_pipeline.py supervise` (systemd-timer, см. systemd/) — dead/halted → алерт; авто-возобновляются ТОЛЬКО transport/crash (потолок max_resumes за окно); limit/budget/errata/artifact_missing/review_empty/review_incomplete/env — решение человека (env — нет claude/node в PATH службы, Н50: надзор показывает env-broken и не тратит max_resumes); остановка по квоте провайдера (transport, cause=quota, Н46) возобновляется ПОСЛЕ сброса и считается отдельным max_quota_resumes. Перед auto_resume проверь PATH службы: docs/CHEATSHEET-WATCHDOG-FAILSAFE.md, чек-лист п. 0"
   },
   "notify": {
     "desktop": true

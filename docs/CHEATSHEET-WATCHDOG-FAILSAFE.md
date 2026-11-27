@@ -71,7 +71,15 @@ duo supervise --dry-run   # что сделал бы надзор (ничего 
   `errata`, `artifact_missing`, `review_empty`, `review_incomplete`, эскалации — решение человека (алерт без запуска); потолок —
   `supervisor.max_resumes` за `resume_window_sec` на задачу (защита от платного цикла);
 - «мёртв» = активная фаза + `.lock` свободен + state не обновлялся ≥ `supervisor.stale_sec` (300 с) и не старше
-  `dead_max_age_sec` (сутки: давние «трупы» и ни разу не запускавшиеся серии — `idle`, не тревога);
+  `dead_max_age_sec` (сутки: давние «трупы» и ни разу не запускавшиеся серии — `idle`, не тревога). Алерт о `dead`
+  несёт **диагноз** (Н54): исключение из `orchestrator_bg.log` либо «записи СТОП и трейса нет — убит снаружи (OOM, kill,
+  выключение)» + время последнего признака жизни + что было в полёте; цена оборванного вызова — `status`, «неучтённых…» (Н55);
+- **квота провайдера** (`halt transport`, `cause=quota`, Н46/Н58): возобновляется только **после сброса** (`reset_at` +
+  `quota.resume_margin_sec`), до того — действие `quota-wait`; считается отдельным потолком `supervisor.max_quota_resumes` и
+  `max_resumes` не тратит; метки сброса нет — `quota-no-reset`, решает человек;
+- **`halt kind=env`** (нет `claude`/`node` в PATH, Н50) надзор не возобновляет: действие `env-broken`, причина в алерте. Если
+  включён `auto_resume`, а окружение службы не позволяет вызвать модель, возобновление не пробуется вовсе (`env-broken`) —
+  `max_resumes` не сгорает;
 - автопродолжение `impl_pending` **не делается**: запуск имплементации — решение эксперта после приёмки плана.
 
 Без systemd: `setsid nohup duo supervise --loop --interval 60 >/dev/null 2>&1 &`
@@ -109,6 +117,12 @@ duo supervise --dry-run   # что сделал бы надзор (ничего 
 проектном слое — рекомендуемое умолчание: умолчание инструмента — `true` (см. раздел «Серии на живом
 оборудовании» в `CHEATSHEET-CONTROL.md`).
 
+**Второй канал уведомлений** (Н54). Десктоп-уведомление в сессии, где никто не смотрит, — единственный сигнал: серия умерла
+ночью, и человек узнал утром. Ключ `notify.command` (argv без shell, подстановки `{title}`/`{body}`, переменные
+`DUO_NOTIFY_TITLE`/`DUO_NOTIFY_BODY`, `notify.command_timeout_sec`) добавляет канал — почту, мессенджер, webhook; он включён
+независимо от `notify.desktop`. В строке тика итог по каждому каналу (`… \| команда: доставлено (…)` / `НЕ доставлено: …`),
+`halt.notified=true` при приёме хотя бы одним каналом.
+
 **Машина без рабочего стола (сервер, AMD-стенд).** Уведомления идут через `notify-send` (ключ
 `notify.desktop`); без графической сессии и D-Bus они не доходят — сбой на работу надзора не влияет, но и
 не теряется молча: итог доставки пишется в строку тика (`journalctl --user -u duo-supervise.service`):
@@ -136,6 +150,13 @@ rc=0)` / `НЕ доставлено: <причина: нет notify-send, тай
 
 ### Чек-лист включения на новой машине
 
+0. **PATH службы (Н50, обязательно перед `auto_resume`).** User-сервис systemd запускается с урезанным PATH: `claude`,
+   поставленный через npm, — скрипт с `#!/usr/bin/env node`, и без каталога `node` в PATH возобновление падает
+   `FileNotFoundError: 'claude'` (в поле — 4 попытки за 7 минут, `max_resumes` исчерпан). Проверка без модели:
+   `env -i PATH="<PATH из Environment= unit-файла>" sh -c 'command -v claude; command -v node'` — оба пути должны
+   напечататься. Нет — добавить в `duo-supervise.service` строку `Environment=PATH=<каталог claude>:<каталог node>:/usr/bin:/bin`
+   (затем `systemctl --user daemon-reload`) либо задать `claude_bin` (абсолютный путь). С Н50 инструмент и сам проверяет
+   окружение перед `run` и показывает причину (`env-broken`), но лучше узнать до ночи.
 1. **Окружение работает.** Из каталога проекта: `duo selftest` — проверяет персоны ревьюеров, профиль
    модели и один вызов модели (≈ $0,1). Если в неинтерактивном ssh `duo` не находится в PATH —
    вызывайте `~/.local/bin/duo` полным путём. Об установке и машинных настройках — `docs/PROJECT-SETUP.md`, «Несколько машин».
@@ -160,6 +181,7 @@ rc=0)` / `НЕ доставлено: <причина: нет notify-send, тай
 ```bash
 duo status --task X          # halt.kind, stop_reason, процесс
 duo run --task X --resume    # transport / crash / artifact_missing
+duo run --task X --resume --wait-quota   # квота провайдера (halt cause=quota): сам дождётся сброса
 duo run --task X --resume --add-iterations 3   # limit
 duo run --task X --resume --add-budget 40      # budget
 ```
@@ -173,7 +195,10 @@ duo run --task X --resume --add-budget 40      # budget
 - алерты не приходят на рабочий стол → у user-сервиса нет D-Bus: проверь
   `systemctl --user show-environment | grep DBUS`; в `duo-supervise.service` задан
   `DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/%U/bus`;
-- хочется «просто посмотреть»: `supervise --dry-run` и `status --all`.
+- хочется «просто посмотреть»: `supervise --dry-run` и `status --all`;
+- оркестратор, запущенный надзором, остаётся в cgroup службы (`Unit process … remains running after unit stopped` в журнале) и
+  без лимита памяти — для изоляции включить `parallel.isolate_cgroup` (+ `memory_max`) в конфиге проекта: надзор возобновляет серию
+  тем же `run_detached`, поэтому она пойдёт в собственной области (Н51).
 
 ## Другие «вечные» сторожа (ночные калибровки и т.п.)
 
